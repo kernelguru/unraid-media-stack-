@@ -18,7 +18,7 @@
 #  "mediastack.conf" neben das Script legen (wird automatisch geladen).
 # =============================================================================
 set -Eeuo pipefail
-SCRIPT_VERSION="1.1.0"
+SCRIPT_VERSION="1.1.1"
 REPO_RAW="https://raw.githubusercontent.com/kernelguru/unraid-media-stack-/main"
 
 # ------------------------------- KONFIGURATION -------------------------------
@@ -98,13 +98,32 @@ exists() { docker container inspect "$1" >/dev/null 2>&1; }
 
 port_busy() { (echo >/dev/tcp/127.0.0.1/"$1") >/dev/null 2>&1; }
 
-wait_http() {  # url [sekunden]
-  local url=$1 t=${2:-240} i=0
+wait_http() {  # url [sekunden] – wartet auf 2xx/3xx/401 (z. B. nicht auf 503 "startet noch")
+  local url=$1 t=${2:-300} i=0 code
   printf '    warte auf %s ' "$url"
-  until curl -s -o /dev/null -m 5 "$url"; do
-    (( i++ >= t/3 )) && { echo; return 1; }
+  while :; do
+    code=$(curl -s -o /dev/null -m 5 -w '%{http_code}' "$url" || true)
+    [[ $code =~ ^[23] || $code == 401 ]] && break
+    (( i++ >= t/3 )) && { echo " (HTTP ${code:-keine Antwort})"; return 1; }
     printf '.'; sleep 3
   done; echo " ok"
+}
+
+# Container sauber stoppen (rclone kann so den Mount aushängen), dann löschen
+remove_ct() { docker stop -t 30 "$1" >/dev/null 2>&1 || true; docker rm -f "$1" >/dev/null; }
+
+# Mountpunkt vorbereiten: toten FUSE-Mount aufräumen, Bind-Mount "shared" machen
+prep_mount() {
+  if awk -v m="$MOUNT_HOST" '$2==m && /fuse/' /proc/mounts | grep -q . \
+     && ! ls "$MOUNT_HOST" >/dev/null 2>&1; then
+    warn "Toter Mount unter $MOUNT_HOST – wird aufgeräumt"
+    umount -l "$MOUNT_HOST" 2>/dev/null || fusermount -uz "$MOUNT_HOST" 2>/dev/null || true
+  fi
+  mkdir -p "$MOUNT_HOST"
+  if ! awk -v m="$MOUNT_HOST" '$2==m && /fuse/' /proc/mounts | grep -q .; then
+    mountpoint -q "$MOUNT_HOST" || mount --bind "$MOUNT_HOST" "$MOUNT_HOST"
+    mount --make-shared "$MOUNT_HOST"
+  fi
 }
 
 # HTTP-Aufruf mit Fehlertext statt stillem Scheitern
@@ -162,7 +181,8 @@ run_ct() {  # name webui-port icon-url -- docker-args...
     fi
     if (( APPLY )); then
       log "$name: Konfiguration/Image geändert → wird neu angelegt (Daten bleiben)"
-      docker rm -f "$name" >/dev/null
+      remove_ct "$name"
+      [[ $name == rclone-nzbdav ]] && prep_mount
     else
       warn "$name: Konfiguration oder Image geändert – übernehmen mit: bash $SELF_NAME update"
       return 0
@@ -194,7 +214,7 @@ case "$CMD" in
       --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'
     echo "Script-Version: $SCRIPT_VERSION"; exit 0 ;;
   remove)
-    for c in "${CONTAINERS[@]}"; do exists "$c" && docker rm -f "$c" >/dev/null && log "$c entfernt"; done
+    for c in "${CONTAINERS[@]}"; do exists "$c" && remove_ct "$c" && log "$c entfernt"; done
     log "Configs in $APPDATA und Medien in $DATA wurden NICHT gelöscht."; exit 0 ;;
   self-update)
     log "Lade neue Version von GitHub"
@@ -212,7 +232,7 @@ case "$CMD" in
     [[ $# -gt 0 ]] || die "Welche Container? z. B.: bash $SELF_NAME recreate jellyfin"
     for c in "$@"; do
       [[ " ${CONTAINERS[*]} " == *" $c "* ]] || die "Unbekannter Container: $c (${CONTAINERS[*]})"
-      exists "$c" && docker rm -f "$c" >/dev/null && log "$c entfernt – wird neu angelegt"
+      exists "$c" && remove_ct "$c" && log "$c entfernt – wird neu angelegt"
     done ;;
   install)  ;;
   help|-h|--help) usage; exit 0 ;;
@@ -252,7 +272,7 @@ save_secret ADMIN_USER "$ADMIN_USER"; save_secret ADMIN_PASS "$ADMIN_PASS"
 
 # ------------------------------- 1. Ordner -----------------------------------
 log "Lege Ordner an"
-mkdir -p "$DATA/media/movies" "$DATA/media/tv" "$MOUNT_HOST" \
+mkdir -p "$DATA/media/movies" "$DATA/media/tv" \
          "$APPDATA"/{infinidysk,rclone-nzbdav/cache,prowlarr,radarr,sonarr,jellyfin,seerr}
 chown "$PUID:$PGID" "$DATA" "$DATA/media" "$DATA/media/movies" "$DATA/media/tv"
 chown -R "$PUID:$PGID" "$APPDATA"/{infinidysk,prowlarr,radarr,sonarr,jellyfin}
@@ -261,11 +281,7 @@ chown -R 1000:1000 "$APPDATA/seerr"     # Seerr läuft als UID 1000
 # ------------------------------- 2. Mount-Propagation ------------------------
 # Damit der rclone-Mount aus dem Container auf dem Host und in den anderen
 # Containern sichtbar wird, muss der Mountpunkt "shared" sein.
-make_shared() {
-  mountpoint -q "$MOUNT_HOST" || mount --bind "$MOUNT_HOST" "$MOUNT_HOST"
-  mount --make-shared "$MOUNT_HOST"
-}
-if ! awk -v m="$MOUNT_HOST" '$2==m && /fuse/' /proc/mounts | grep -q .; then make_shared; fi
+prep_mount
 GO=/boot/config/go
 if [[ -f $GO ]] && ! grep -q '# >>> mediastack' "$GO"; then
   log "Trage Mount-Vorbereitung in $GO ein (für Neustarts)"
@@ -374,7 +390,11 @@ printf '    warte auf rclone-Mount '
 for i in $(seq 1 40); do
   awk -v m="$MOUNT_HOST" '$2==m && /fuse/' /proc/mounts | grep -q . && { echo " ok"; break; }
   printf '.'; sleep 3
-  [[ $i == 40 ]] && { echo; warn "Mount nicht sichtbar – docker logs rclone-nzbdav prüfen."; }
+  if [[ $i == 40 ]]; then
+    echo; warn "rclone-Mount nicht sichtbar. Letzte Logs von rclone-nzbdav:"
+    docker logs --tail 20 rclone-nzbdav 2>&1 | sed 's/^/      /' >&2 || true
+    warn "Radarr/Sonarr/Jellyfin laufen weiter, Streams gehen aber erst mit Mount."
+  fi
 done
 
 # ------------------------------- 6. Apps starten -----------------------------
@@ -483,6 +503,7 @@ JF_AUTH='MediaBrowser Client="mediastack", Device="setup", DeviceId="mediastack-
 jfc() { local m=$1 u=$2 d=${3:-}; http "$m" "$JF$u" "$d" -H "Authorization: $JF_AUTH${JF_TOKEN:+, Token=\"$JF_TOKEN\"}"; }
 
 JF_TOKEN=""
+wait_http "$JF/System/Info/Public" || die "Jellyfin antwortet nicht – Logs: docker logs jellyfin"
 if [[ $(jfc GET /System/Info/Public | jq -r .StartupWizardCompleted) != true ]]; then
   jfc POST /Startup/Configuration "$(jq -nc --arg l "$LANG_CODE" --arg c "$COUNTRY_CODE" \
        '{UICulture:$l,MetadataCountryCode:$c,PreferredMetadataLanguage:$l}')" >/dev/null
