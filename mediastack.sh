@@ -18,7 +18,7 @@
 #  "mediastack.conf" neben das Script legen (wird automatisch geladen).
 # =============================================================================
 set -Eeuo pipefail
-SCRIPT_VERSION="1.1.1"
+SCRIPT_VERSION="1.2.0"
 REPO_RAW="https://raw.githubusercontent.com/kernelguru/unraid-media-stack-/main"
 
 # ------------------------------- KONFIGURATION -------------------------------
@@ -52,14 +52,25 @@ IMG_RADARR="lscr.io/linuxserver/radarr:latest"
 IMG_SONARR="lscr.io/linuxserver/sonarr:latest"
 IMG_JELLYFIN="lscr.io/linuxserver/jellyfin:latest"
 IMG_SEERR="ghcr.io/seerr-team/seerr:latest"
+IMG_RECYCLARR="ghcr.io/recyclarr/recyclarr:8"    # "latest" wird nicht mehr gepflegt
 
 # Ports
 P_INFINIDYSK=3000; P_PROWLARR=9696; P_RADARR=7878
 P_SONARR=8989;     P_JELLYFIN=8096; P_SEERR=5055
 
+# TRaSH-Guides per Recyclarr (Qualitätsprofile + Custom Formats)
+RECYCLARR_ENABLED=true
+# Deutsche Profile: german-hd-bluray-web, german-hd-remux-web,
+#   german-uhd-bluray-web, german-uhd-bluray-web-alternative,
+#   german-uhd-remux-web, german-anime-hd-bluray-web
+TRASH_PROFILE="german-hd-bluray-web"
+RECYCLARR_SCHEDULE="@daily"          # automatischer Abgleich (Cron-Syntax)
+SEERR_USE_TRASH_PROFILE=true         # Seerr fordert mit dem TRaSH-Profil an
+TEMPLATES_RAW="https://raw.githubusercontent.com/recyclarr/config-templates/master"
+
 # Zusätzliche Volumes pro Container ("host:container[:optionen]")
 # Gibt es für jeden Container: JELLYFIN_, RADARR_, SONARR_, PROWLARR_, SEERR_,
-# INFINIDYSK_, RCLONE_NZBDAV_EXTRA_VOLUMES
+# INFINIDYSK_, RCLONE_NZBDAV_, RECYCLARR_EXTRA_VOLUMES
 JELLYFIN_EXTRA_VOLUMES=(
   # "/mnt/user/Fotos:/data/fotos:ro"
 )
@@ -78,7 +89,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 STATE_DIR="$APPDATA/mediastack"
 SECRETS="$STATE_DIR/secrets.env"
-CONTAINERS=(seerr jellyfin sonarr radarr prowlarr rclone-nzbdav infinidysk)
+CONTAINERS=(seerr jellyfin recyclarr sonarr radarr prowlarr rclone-nzbdav infinidysk)
 
 # ------------------------------- Hilfsfunktionen -----------------------------
 c_g=$'\e[32m'; c_y=$'\e[33m'; c_r=$'\e[31m'; c_b=$'\e[1m'; c_0=$'\e[0m'
@@ -496,6 +507,44 @@ for entry in "${INDEXERS[@]}"; do
   arr "$KEY_PROWLARR" POST "$PB/indexer" "$body" >/dev/null && log "  Indexer $iname angelegt" || warn "  Indexer $iname fehlgeschlagen"
 done
 
+# ------------------------------- 7b. TRaSH-Guides (Recyclarr) ---------------
+# Bevorzugt ein "[German] ..."-Profil, sonst das erste vorhandene
+pick_profile() {  # key base-url -> {"id":..,"name":..}
+  arr "$1" GET "$2/api/v3/qualityprofile" | jq -c '([.[] | select(.name|startswith("[German]"))] + .)[0] | {id,name}'
+}
+
+if [[ $RECYCLARR_ENABLED == true ]]; then
+  log "TRaSH-Guides über Recyclarr: $TRASH_PROFILE"
+  RC="$APPDATA/recyclarr"
+  mkdir -p "$RC/configs"
+  for app in radarr sonarr; do
+    f="$RC/configs/$app.yml"
+    if [[ -f $f ]]; then log "  $app.yml existiert – deine Anpassungen bleiben"; continue; fi
+    if [[ $app == radarr ]]; then u=$RA; k=$KEY_RADARR; else u=$SO; k=$KEY_SONARR; fi
+    if ! curl -fsSL "$TEMPLATES_RAW/$app/templates/$TRASH_PROFILE.yml" -o "$f.tmp"; then
+      rm -f "$f.tmp"; warn "  Vorlage '$TRASH_PROFILE' für $app nicht gefunden – TRASH_PROFILE prüfen"; continue
+    fi
+    sed -e "0,/base_url:/s|^\([[:space:]]*base_url:\).*|\1 $u|" \
+        -e "0,/api_key:/s|^\([[:space:]]*api_key:\).*|\1 $k|" "$f.tmp" > "$f"
+    rm -f "$f.tmp"
+    log "  $app.yml aus Vorlage erstellt"
+  done
+  chown -R "$PUID:$PGID" "$RC"; chmod 600 "$RC"/configs/*.yml 2>/dev/null || true
+
+  run_ct recyclarr "" "$ICON/recyclarr.png" -- \
+    --user "$PUID:$PGID" -e CRON_SCHEDULE="$RECYCLARR_SCHEDULE" \
+    -v "$RC:/config" "$IMG_RECYCLARR"
+
+  sleep 3
+  log "  Erster Abgleich (kann 1–2 Minuten dauern)"
+  if docker exec recyclarr recyclarr sync >"$RC/last-sync.log" 2>&1; then
+    log "  Profile und Custom Formats übernommen"
+  else
+    warn "  Recyclarr-Abgleich mit Fehlern – Details: $RC/last-sync.log"
+    tail -n 15 "$RC/last-sync.log" | sed 's/^/      /' >&2 || true
+  fi
+fi
+
 # ------------------------------- 8. Jellyfin ---------------------------------
 log "Konfiguriere Jellyfin"
 wait_http "$JF/health"
@@ -561,14 +610,14 @@ seerr_setup() {
   ids=$(se GET "/settings/jellyfin/library?sync=true" | jq -r '[.[].id] | join(",")') || return 1
   se GET "/settings/jellyfin/library?enable=$ids" >/dev/null || return 1
 
-  rp=$(arr "$KEY_RADARR" GET "$RA/api/v3/qualityprofile" | jq -c '.[0]') || return 1
+  rp=$(pick_profile "$KEY_RADARR" "$RA") || return 1
   se POST /settings/radarr "$(jq -nc --arg h "$SERVER_IP" --argjson port $P_RADARR --arg k "$KEY_RADARR" --argjson qp "$rp" '{
       name:"Radarr", hostname:$h, port:$port, apiKey:$k, useSsl:false, baseUrl:"",
       activeProfileId:$qp.id, activeProfileName:$qp.name, activeDirectory:"/data/media/movies",
       is4k:false, minimumAvailability:"released", tags:[], isDefault:true,
       externalUrl:"", syncEnabled:true, preventSearch:false }')" >/dev/null || return 1
 
-  sp=$(arr "$KEY_SONARR" GET "$SO/api/v3/qualityprofile" | jq -c '.[0]') || return 1
+  sp=$(pick_profile "$KEY_SONARR" "$SO") || return 1
   se POST /settings/sonarr "$(jq -nc --arg h "$SERVER_IP" --argjson port $P_SONARR --arg k "$KEY_SONARR" --argjson qp "$sp" '{
       name:"Sonarr", hostname:$h, port:$port, apiKey:$k, useSsl:false, baseUrl:"",
       activeProfileId:$qp.id, activeProfileName:$qp.name, activeDirectory:"/data/media/tv",
@@ -580,8 +629,27 @@ seerr_setup() {
   se POST /settings/initialize >/dev/null
 }
 
+seerr_use_profile() {  # Standard-Server in Seerr auf das TRaSH-Profil umstellen
+  se POST /auth/jellyfin "$(jq -nc --arg u "$ADMIN_USER" --arg p "$ADMIN_PASS" '{username:$u,password:$p}')" >/dev/null || return 1
+  local svc key base qp servers id body
+  for svc in radarr sonarr; do
+    if [[ $svc == radarr ]]; then key=$KEY_RADARR; base=$RA; else key=$KEY_SONARR; base=$SO; fi
+    qp=$(pick_profile "$key" "$base") || return 1
+    [[ $(jq -r .name <<<"$qp") == "[German]"* ]] || continue
+    servers=$(se GET "/settings/$svc") || return 1
+    for id in $(jq -r --arg n "$(jq -r .name <<<"$qp")" '.[] | select(.is4k|not) | select(.activeProfileName != $n) | .id' <<<"$servers"); do
+      body=$(jq -c --argjson id "$id" --argjson qp "$qp" '.[] | select(.id==$id)
+              | .activeProfileId=$qp.id | .activeProfileName=$qp.name' <<<"$servers")
+      se PUT "/settings/$svc/$id" "$body" >/dev/null && log "  Seerr ($svc) nutzt jetzt Profil $(jq -r .name <<<"$qp")"
+    done
+  done
+}
+
 if [[ $(se GET /settings/public | jq -r .initialized) == true ]]; then
   log "  Seerr ist bereits eingerichtet"
+  if [[ $RECYCLARR_ENABLED == true && $SEERR_USE_TRASH_PROFILE == true ]]; then
+    seerr_use_profile || warn "  Seerr-Profil konnte nicht umgestellt werden (Login?) – in Seerr unter Einstellungen → Dienste anpassen."
+  fi
 elif seerr_setup; then
   log "  Seerr mit Jellyfin, Radarr und Sonarr verbunden"
 else

@@ -11,6 +11,7 @@ Ein Script, das einen kompletten **Usenet-Streaming-Media-Stack** auf Unraid ins
 | **Sonarr** | Serien | 8989 |
 | **Jellyfin** | Mediaserver | 8096 |
 | **Seerr** | Anfragen für Filme und Serien | 5055 |
+| **Recyclarr** | Überträgt die deutschen TRaSH-Guides-Profile in Radarr/Sonarr und gleicht sie täglich ab | – |
 
 ## So funktioniert es
 
@@ -92,6 +93,37 @@ bash mediastack.sh recreate jellyfin  # einzelne Container neu anlegen (mehrere 
 bash mediastack.sh status             # Status der Container + Script-Version
 bash mediastack.sh remove             # Container entfernen (Configs und Medien bleiben erhalten)
 ```
+
+## TRaSH-Guides (deutsche Profile)
+
+[Recyclarr](https://recyclarr.dev) überträgt die Qualitätsprofile und Custom Formats aus den [TRaSH-Guides](https://trash-guides.info) nach Radarr und Sonarr und hält sie aktuell.
+
+Das Script macht dafür Folgendes:
+
+1. Es lädt die offizielle Vorlage für das gewählte Profil aus [recyclarr/config-templates](https://github.com/recyclarr/config-templates) und trägt URL und API-Key ein. Das ergibt `appdata/recyclarr/configs/radarr.yml` und `sonarr.yml`.
+2. Es startet den Container `recyclarr`. Er gleicht standardmäßig täglich ab (`RECYCLARR_SCHEDULE`).
+3. Es führt den ersten Abgleich sofort aus. Danach gibt es in Radarr und Sonarr z. B. das Profil **[German] HD Bluray + WEB**.
+4. Seerr fordert ab jetzt mit diesem Profil an.
+
+Profil wählen (`TRASH_PROFILE` in `mediastack.conf`):
+
+| Wert | Profil |
+|---|---|
+| `german-hd-bluray-web` *(Standard)* | 1080p (720p als Fallback), Bluray + WEB |
+| `german-hd-remux-web` | 1080p, Remux + WEB |
+| `german-uhd-bluray-web` | 2160p, Bluray + WEB |
+| `german-uhd-bluray-web-alternative` | 2160p, Variante des UHD-Profils (siehe TRaSH-Guides) |
+| `german-uhd-remux-web` | 2160p, Remux + WEB |
+| `german-anime-hd-bluray-web` | Anime |
+
+**Anpassen:** Die Dateien `appdata/recyclarr/configs/*.yml` gehören dir. Du kannst dort zusätzliche Custom-Format-Gruppen aktivieren, etwa Streaming-Dienste oder Movie Versions. Die Optionen stehen als Kommentare in der Datei. Das Script überschreibt die Dateien nie. Ein Abgleich von Hand geht mit `docker exec recyclarr recyclarr sync`.
+
+**Profil wechseln:** `TRASH_PROFILE` ändern, die beiden `.yml` löschen, dann `bash mediastack.sh update` ausführen.
+
+**Hinweise:**
+- Filme und Serien, die schon in der Bibliothek sind, behalten ihr altes Profil. Du stellst sie in Radarr/Sonarr über *Bibliothek bearbeiten* (Mehrfachauswahl) um.
+- Die Option `SEERR_USE_TRASH_PROFILE=true` stellt die Standard-Server in Seerr auf das `[German]`-Profil um. Mit `false` bleibt deine Auswahl in Seerr unangetastet.
+- Recyclarr setzt `reset_unmatched_scores`. Eigene Bewertungen für Custom Formats, die im Profil nicht vorkommen, werden deshalb auf 0 zurückgesetzt.
 
 ## Zusätzliche Volumes (z. B. ein weiterer Ordner für Jellyfin)
 

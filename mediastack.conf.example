@@ -32,6 +32,14 @@
 #P_JELLYFIN=8096
 #P_SEERR=5055
 
+# TRaSH-Guides per Recyclarr
+#RECYCLARR_ENABLED=true
+# german-hd-bluray-web | german-hd-remux-web | german-uhd-bluray-web |
+# german-uhd-bluray-web-alternative | german-uhd-remux-web | german-anime-hd-bluray-web
+#TRASH_PROFILE="german-hd-bluray-web"
+#RECYCLARR_SCHEDULE="@daily"
+#SEERR_USE_TRASH_PROFILE=true
+
 # Zusätzliche Volumes ("host:container[:optionen]")
 # Nach einer Änderung: bash mediastack.sh update
 # Verfügbar: JELLYFIN_, RADARR_, SONARR_, PROWLARR_, SEERR_, INFINIDYSK_,
