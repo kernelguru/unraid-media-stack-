@@ -18,7 +18,7 @@
 #  "mediastack.conf" neben das Script legen (wird automatisch geladen).
 # =============================================================================
 set -Eeuo pipefail
-SCRIPT_VERSION="1.2.0"
+SCRIPT_VERSION="1.2.1"
 REPO_RAW="https://raw.githubusercontent.com/kernelguru/unraid-media-stack-/main"
 
 # ------------------------------- KONFIGURATION -------------------------------
@@ -603,12 +603,31 @@ wait_http "$SE/api/v1/status"
 JAR=$(mktemp)
 se() { local m=$1 u=$2 d=${3:-}; http "$m" "$SE/api/v1$u" "$d" -b "$JAR" -c "$JAR"; }
 
+# Jellyfin-Bibliotheken in Seerr synchronisieren und alle aktivieren
+# (Seerr >= 3.x: POST .../library/sync + PUT .../library/<id>; ältere: GET ?sync/&enable)
+seerr_libraries() {
+  local libs id ids
+  if libs=$(se POST /settings/jellyfin/library/sync 2>/dev/null); then
+    [[ $(jq length <<<"$libs") -gt 0 ]] || { warn "  Jellyfin hat keine Film-/Serien-Bibliotheken"; return 1; }
+    for id in $(jq -r '.[].id' <<<"$libs"); do
+      se PUT "/settings/jellyfin/library/$id" '{"enabled":true}' >/dev/null || return 1
+    done
+  else
+    ids=$(se GET "/settings/jellyfin/library?sync=true" | jq -r '[.[].id] | join(",")') || return 1
+    se GET "/settings/jellyfin/library?enable=$ids" >/dev/null || return 1
+  fi
+  log "  Seerr: Jellyfin-Bibliotheken aktiviert"
+}
+
 seerr_setup() {
+  # Anmelden. Ist der Jellyfin-Host schon gespeichert (halb abgeschlossene
+  # Einrichtung), lehnt Seerr "hostname" ab -> dann ohne Host erneut.
   se POST /auth/jellyfin "$(jq -nc --arg u "$ADMIN_USER" --arg p "$ADMIN_PASS" --arg h "$SERVER_IP" \
      --argjson port $P_JELLYFIN --arg e "$ADMIN_EMAIL" \
-     '{username:$u,password:$p,hostname:$h,port:$port,useSsl:false,urlBase:"",email:$e,serverType:2}')" >/dev/null || return 1
-  ids=$(se GET "/settings/jellyfin/library?sync=true" | jq -r '[.[].id] | join(",")') || return 1
-  se GET "/settings/jellyfin/library?enable=$ids" >/dev/null || return 1
+     '{username:$u,password:$p,hostname:$h,port:$port,useSsl:false,urlBase:"",email:$e,serverType:2}')" >/dev/null 2>&1 \
+  || se POST /auth/jellyfin "$(jq -nc --arg u "$ADMIN_USER" --arg p "$ADMIN_PASS" '{username:$u,password:$p}')" >/dev/null \
+  || return 1
+  seerr_libraries || return 1
 
   rp=$(pick_profile "$KEY_RADARR" "$RA") || return 1
   se POST /settings/radarr "$(jq -nc --arg h "$SERVER_IP" --argjson port $P_RADARR --arg k "$KEY_RADARR" --argjson qp "$rp" '{
