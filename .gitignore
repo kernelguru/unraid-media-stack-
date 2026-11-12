@@ -1,0 +1,3 @@
+# Eigene Konfiguration kann Passwörter/API-Keys enthalten
+mediastack.conf
+secrets.env

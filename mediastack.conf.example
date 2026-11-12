@@ -1,0 +1,39 @@
+# Kopieren nach "mediastack.conf" (neben mediastack.sh) und anpassen.
+# Alles, was hier nicht steht, nimmt die Standardwerte aus dem Script.
+
+#SERVER_IP="192.168.1.10"           # leer = automatisch erkennen
+#TZ="Europe/Berlin"
+#PUID=99
+#PGID=100
+
+#APPDATA="/mnt/user/appdata"
+#DATA="/mnt/user/data"
+#MOUNT_HOST="/mnt/addons/nzbdav"     # NICHT unter /mnt/user!
+
+#ADMIN_USER="admin"
+#ADMIN_PASS=""                       # leer = wird beim Start abgefragt
+#ADMIN_EMAIL="admin@mediastack.local"
+
+#LANG_CODE="de"
+#COUNTRY_CODE="DE"
+
+#CAT_MOVIES="movies"
+#CAT_TV="tv"
+#RCLONE_CACHE_SIZE="50G"
+
+# Image von InfiniDysk – bitte prüfen/anpassen
+#IMG_INFINIDYSK="ghcr.io/infinidysk/infinidysk:latest"
+
+# Ports
+#P_INFINIDYSK=3000
+#P_PROWLARR=9696
+#P_RADARR=7878
+#P_SONARR=8989
+#P_JELLYFIN=8096
+#P_SEERR=5055
+
+# Usenet-Indexer automatisch in Prowlarr anlegen
+# Format: "Name|https://indexer.tld|APIKEY"
+#INDEXERS=(
+#  "NZBgeek|https://api.nzbgeek.info|DEIN_API_KEY"
+#)
