@@ -7,14 +7,19 @@
 #    Prowlarr, Radarr, Sonarr, Jellyfin, Seerr
 #
 #  Aufruf (als root im Unraid-Terminal / per SSH):
-#    bash mediastack.sh            -> installieren + konfigurieren (idempotent)
-#    bash mediastack.sh status     -> Container-Status anzeigen
-#    bash mediastack.sh remove     -> Container entfernen (Daten bleiben!)
+#    bash mediastack.sh                 -> installieren + konfigurieren (idempotent)
+#    bash mediastack.sh update          -> Images aktualisieren + geänderte Konfig übernehmen
+#    bash mediastack.sh self-update     -> Script von GitHub holen, danach "update"
+#    bash mediastack.sh recreate NAME.. -> einzelne Container neu anlegen
+#    bash mediastack.sh status          -> Container-Status anzeigen
+#    bash mediastack.sh remove          -> Container entfernen (Daten bleiben!)
 #
 #  Eigene Werte: entweder unten im Block "KONFIGURATION" ändern oder eine Datei
 #  "mediastack.conf" neben das Script legen (wird automatisch geladen).
 # =============================================================================
 set -Eeuo pipefail
+SCRIPT_VERSION="1.1.0"
+REPO_RAW="https://raw.githubusercontent.com/kernelguru/unraid-media-stack-/main"
 
 # ------------------------------- KONFIGURATION -------------------------------
 SERVER_IP=""                         # leer = automatisch erkennen
@@ -51,6 +56,15 @@ IMG_SEERR="ghcr.io/seerr-team/seerr:latest"
 # Ports
 P_INFINIDYSK=3000; P_PROWLARR=9696; P_RADARR=7878
 P_SONARR=8989;     P_JELLYFIN=8096; P_SEERR=5055
+
+# Zusätzliche Volumes pro Container ("host:container[:optionen]")
+# Gibt es für jeden Container: JELLYFIN_, RADARR_, SONARR_, PROWLARR_, SEERR_,
+# INFINIDYSK_, RCLONE_NZBDAV_EXTRA_VOLUMES
+JELLYFIN_EXTRA_VOLUMES=(
+  # "/mnt/user/Fotos:/data/fotos:ro"
+)
+RADARR_EXTRA_VOLUMES=()
+SONARR_EXTRA_VOLUMES=()
 
 # Optional: Usenet-Indexer, die automatisch in Prowlarr angelegt werden
 # Format: "Name|https://indexer.tld|APIKEY"
@@ -113,30 +127,96 @@ save_secret() {  # name wert
   printf '%s=%q\n' "$1" "$2" >> "$SECRETS"
 }
 
-# docker run mit Unraid-Labels (WebUI-Link + Icon im Docker-Tab)
+# docker run mit Unraid-Labels (WebUI-Link + Icon im Docker-Tab).
+# Jeder Container bekommt ein Label "mediastack.hash" mit einem Fingerabdruck
+# seiner Konfiguration. So erkennt "update", ob er neu angelegt werden muss.
 run_ct() {  # name webui-port icon-url -- docker-args...
   local name=$1 port=$2 icon=$3; shift 4
-  if exists "$name"; then log "$name existiert bereits – übersprungen"; return 0; fi
+
+  # Extra-Volumes aus <NAME>_EXTRA_VOLUMES
+  local var="${name//-/_}"; var="${var^^}_EXTRA_VOLUMES"
+  local extra=() v host
+  if declare -p "$var" >/dev/null 2>&1; then
+    local ref="$var[@]"
+    for v in "${!ref}"; do
+      host=${v%%:*}
+      [[ -e $host ]] || die "$var: Host-Pfad '$host' existiert nicht – bitte zuerst anlegen."
+      extra+=(-v "$v")
+    done
+  fi
+
+  local hash; hash=$(printf '%s\0' "$TZ" "${extra[@]}" "$@" | md5sum | cut -c1-12)
+
+  if exists "$name"; then
+    local old; old=$(docker inspect -f '{{index .Config.Labels "mediastack.hash"}}' "$name")
+    [[ $old == "<no value>" ]] && old=""
+    if [[ -z $old ]]; then
+      log "$name existiert (nicht vom Script verwaltet) – übersprungen"
+      return 0
+    fi
+    local cur_img new_img
+    cur_img=$(docker inspect -f '{{.Image}}' "$name")
+    new_img=$(docker image inspect -f '{{.Id}}' "$(docker inspect -f '{{.Config.Image}}' "$name")" 2>/dev/null || echo "$cur_img")
+    if [[ $old == "$hash" && $cur_img == "$new_img" ]]; then
+      log "$name ist aktuell"; return 0
+    fi
+    if (( APPLY )); then
+      log "$name: Konfiguration/Image geändert → wird neu angelegt (Daten bleiben)"
+      docker rm -f "$name" >/dev/null
+    else
+      warn "$name: Konfiguration oder Image geändert – übernehmen mit: bash $SELF_NAME update"
+      return 0
+    fi
+  fi
+
   if [[ -n $port ]] && port_busy "$port"; then die "Port $port ist belegt (für $name)"; fi
   log "Starte $name"
-  local labels=(--label net.unraid.docker.managed=dockerman)
+  local labels=(--label net.unraid.docker.managed=dockerman --label "mediastack.hash=$hash")
   [[ -n $port ]] && labels+=(--label "net.unraid.docker.webui=http://[IP]:[PORT:$port]/")
   [[ -n $icon ]] && labels+=(--label "net.unraid.docker.icon=$icon")
   docker run -d --name "$name" --restart unless-stopped \
     --log-opt max-size=10m --log-opt max-file=3 \
-    -e TZ="$TZ" "${labels[@]}" "$@" >/dev/null
+    -e TZ="$TZ" "${labels[@]}" "${extra[@]}" "$@" >/dev/null
 }
 
 ICON="https://cdn.jsdelivr.net/gh/selfhst/icons/png"
 
 # ------------------------------- Sub-Kommandos -------------------------------
-case "${1:-install}" in
-  status) docker ps -a --filter "name=^($(IFS='|'; echo "${CONTAINERS[*]}"))$" \
-            --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'; exit 0 ;;
-  remove) for c in "${CONTAINERS[@]}"; do exists "$c" && docker rm -f "$c" >/dev/null && log "$c entfernt"; done
-          log "Configs in $APPDATA und Medien in $DATA wurden NICHT gelöscht."; exit 0 ;;
-  install) ;;
-  *) die "Unbekannt: $1 (install|status|remove)";;
+SELF="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
+SELF_NAME="$(basename "$SELF")"
+usage() { sed -n '9,15p' "$SELF" | sed 's/^#//'; }
+
+CMD=${1:-install}; shift || true
+APPLY=0; PULL=0
+case "$CMD" in
+  status)
+    docker ps -a --filter "name=^($(IFS='|'; echo "${CONTAINERS[*]}"))$" \
+      --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'
+    echo "Script-Version: $SCRIPT_VERSION"; exit 0 ;;
+  remove)
+    for c in "${CONTAINERS[@]}"; do exists "$c" && docker rm -f "$c" >/dev/null && log "$c entfernt"; done
+    log "Configs in $APPDATA und Medien in $DATA wurden NICHT gelöscht."; exit 0 ;;
+  self-update)
+    log "Lade neue Version von GitHub"
+    new="$SELF.new"
+    curl -fsSL "$REPO_RAW/mediastack.sh" -o "$new" || { rm -f "$new"; die "Download fehlgeschlagen"; }
+    bash -n "$new" || { rm -f "$new"; die "Heruntergeladenes Script ist fehlerhaft – nichts geändert."; }
+    new_ver=$(sed -n 's/^SCRIPT_VERSION="\(.*\)"/\1/p' "$new")
+    cp -p "$SELF" "$SELF.bak"
+    chmod +x "$new"; mv -f "$new" "$SELF"     # atomar ersetzen
+    log "Script $SCRIPT_VERSION → ${new_ver:-?} (Backup: $SELF_NAME.bak)"
+    [[ -f "$SCRIPT_DIR/mediastack.conf" ]] && log "Deine mediastack.conf bleibt unverändert."
+    exec bash "$SELF" update ;;
+  update)   APPLY=1; PULL=1 ;;
+  recreate)
+    [[ $# -gt 0 ]] || die "Welche Container? z. B.: bash $SELF_NAME recreate jellyfin"
+    for c in "$@"; do
+      [[ " ${CONTAINERS[*]} " == *" $c "* ]] || die "Unbekannter Container: $c (${CONTAINERS[*]})"
+      exists "$c" && docker rm -f "$c" >/dev/null && log "$c entfernt – wird neu angelegt"
+    done ;;
+  install)  ;;
+  help|-h|--help) usage; exit 0 ;;
+  *) usage; die "Unbekannter Befehl: $CMD" ;;
 esac
 
 # ------------------------------- 0. Prüfungen --------------------------------
@@ -149,6 +229,13 @@ docker info >/dev/null 2>&1 || die "Docker läuft nicht (Array gestartet? Docker
 [[ -n $SERVER_IP ]] || SERVER_IP=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')
 [[ -n $SERVER_IP ]] || die "Server-IP nicht erkannt – bitte SERVER_IP setzen."
 log "Server-IP: $SERVER_IP"
+
+if (( PULL )); then
+  log "Hole aktuelle Images"
+  for v in ${!IMG_@}; do
+    docker pull -q "${!v}" >/dev/null && echo "    ${!v}" || warn "Pull fehlgeschlagen: ${!v}"
+  done
+fi
 
 mkdir -p "$STATE_DIR"
 [[ -f $SECRETS ]] && source "$SECRETS"
@@ -499,3 +586,7 @@ ${c_b}Noch offen:${c_0}
   • Indexer in Prowlarr hinzufügen (falls nicht über INDEXERS gesetzt) –
     sie werden automatisch an Radarr & Sonarr verteilt.
 EOF
+
+if (( APPLY )); then
+  docker image prune -f >/dev/null 2>&1 || true
+fi

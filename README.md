@@ -85,17 +85,74 @@ Zugangsdaten und API-Keys landen in `/mnt/user/appdata/mediastack/secrets.env` (
 ## Befehle
 
 ```bash
-bash mediastack.sh          # installieren/konfigurieren – erneut ausführbar, Vorhandenes wird übersprungen
-bash mediastack.sh status   # Status der Container
-bash mediastack.sh remove   # Container entfernen (Configs und Medien bleiben erhalten)
+bash mediastack.sh                    # installieren/konfigurieren – erneut ausführbar
+bash mediastack.sh update             # Images aktualisieren + geänderte Konfiguration übernehmen
+bash mediastack.sh self-update        # neue Script-Version von GitHub holen, danach automatisch "update"
+bash mediastack.sh recreate jellyfin  # einzelne Container neu anlegen (mehrere möglich)
+bash mediastack.sh status             # Status der Container + Script-Version
+bash mediastack.sh remove             # Container entfernen (Configs und Medien bleiben erhalten)
 ```
+
+## Zusätzliche Volumes (z. B. ein weiterer Ordner für Jellyfin)
+
+Liegt der Ordner unter `/mnt/user/data/media`, sieht Jellyfin ihn schon als `/data/media/...`. Dafür brauchst du kein extra Volume.
+
+Für andere Pfade trägst du die Volumes in `mediastack.conf` ein:
+
+```bash
+JELLYFIN_EXTRA_VOLUMES=(
+  "/mnt/user/Fotos:/data/fotos:ro"
+  "/mnt/user/Musik:/data/musik:ro"
+)
+```
+
+Dann ausführen:
+
+```bash
+bash mediastack.sh update
+```
+
+Das Script erkennt die geänderte Konfiguration und legt **nur Jellyfin** neu an. Bibliotheken, Benutzer und Einstellungen bleiben erhalten, denn sie liegen in appdata. Danach in Jellyfin eine Bibliothek mit dem Pfad `/data/fotos` hinzufügen.
+
+Die gleiche Variable gibt es für jeden Container: `RADARR_`, `SONARR_`, `PROWLARR_`, `SEERR_`, `INFINIDYSK_` und `RCLONE_NZBDAV_EXTRA_VOLUMES`.
+
+## Updates
+
+```bash
+bash mediastack.sh self-update
+```
+
+1. Das Script lädt die neueste `mediastack.sh` von GitHub, prüft die Syntax und ersetzt sich selbst. Die alte Version bleibt als `mediastack.sh.bak` liegen.
+2. **Deine `mediastack.conf` wird nie angefasst.** Neue Variablen haben im Script Standardwerte. Willst du einen davon ändern, trägst du die Variable einfach in deine Konfig ein (siehe `mediastack.conf.example`).
+3. Danach läuft automatisch `update`:
+   - Die Images werden aktualisiert.
+   - Nur Container, deren Image oder Konfiguration sich geändert hat, werden neu angelegt. Alle anderen bleiben unangetastet.
+   - Zugangsdaten und API-Keys kommen aus `secrets.env`, es wird also nichts erneut abgefragt.
+   - Bestehende Einstellungen in den Apps werden nicht überschrieben, fehlende werden ergänzt.
+
+Willst du nur die Images aktualisieren, ohne das Script zu ändern: `bash mediastack.sh update`.
+
+Zurück zur alten Script-Version: `mv mediastack.sh.bak mediastack.sh`
+
+> **Erkennung:** Jeder Container bekommt ein Label `mediastack.hash`, einen Fingerabdruck seiner Konfiguration. Container ohne dieses Label wurden nicht vom Script angelegt (oder von Version 1.0). `update` lässt sie in Ruhe. Mit `bash mediastack.sh recreate <name>` übernimmt das Script sie ausdrücklich.
+
+### Umstieg von Version 1.0
+
+Container aus Version 1.0 haben das Label noch nicht. Deshalb übernimmt sie das Script einmalig mit `recreate`:
+
+```bash
+bash mediastack.sh self-update
+bash mediastack.sh recreate rclone-nzbdav prowlarr radarr sonarr jellyfin seerr
+```
+
+`infinidysk` nur hinzufügen, wenn das Script ihn auch angelegt hat. Die Daten bleiben in jedem Fall erhalten.
 
 ## Wichtige Hinweise
 
 - **Image von InfiniDysk:** Standard ist `ghcr.io/infinidysk/infinidysk:latest`. Bitte prüfen und bei Bedarf über `IMG_INFINIDYSK` anpassen.
 - **`/boot/config/go`:** Das Script ergänzt dort einen markierten Block (`# >>> mediastack`). Er macht den Mountpunkt nach einem Neustart wieder *shared*, damit der rclone-Mount in den anderen Containern ankommt. Zum Deinstallieren den Block einfach löschen.
 - **Netzwerk:** Die Container sprechen über `http://<server-ip>:<port>` miteinander statt über ein eigenes Docker-Netz, denn Unraid löscht eigene Netze standardmäßig beim Neustart von Docker. Der Server sollte deshalb eine **feste IP** haben.
-- **Keine Unraid-Vorlagen:** Die Container werden per `docker run` angelegt. Starten, Stoppen, Logs und WebUI funktionieren im Docker-Tab, *Edit* aber nicht. Änderungen also im Script bzw. in der Konfig vornehmen, den Container mit `docker rm -f <name>` entfernen und das Script erneut starten.
+- **Keine Unraid-Vorlagen:** Die Container werden per `docker run` angelegt. Starten, Stoppen, Logs und WebUI funktionieren im Docker-Tab, *Edit* aber nicht. Änderungen deshalb in `mediastack.conf` vornehmen und `bash mediastack.sh update` ausführen.
 - **Bestehende Container:** Gibt es schon einen Container mit gleichem Namen (z. B. `jellyfin`), wird er nicht angefasst. Die Jellyfin-Automatik funktioniert dann nur, wenn Benutzer und Passwort übereinstimmen.
 - **Sicherheit:** Die Apps sind ohne Reverse Proxy nur für das LAN gedacht. Für den Zugriff von außen bitte einen Reverse Proxy (z. B. Nginx Proxy Manager, SWAG) oder ein VPN (z. B. Tailscale, WireGuard) verwenden.
 

@@ -32,6 +32,17 @@
 #P_JELLYFIN=8096
 #P_SEERR=5055
 
+# Zusätzliche Volumes ("host:container[:optionen]")
+# Nach einer Änderung: bash mediastack.sh update
+# Verfügbar: JELLYFIN_, RADARR_, SONARR_, PROWLARR_, SEERR_, INFINIDYSK_,
+#            RCLONE_NZBDAV_EXTRA_VOLUMES
+#JELLYFIN_EXTRA_VOLUMES=(
+#  "/mnt/user/Fotos:/data/fotos:ro"
+#  "/mnt/user/Musik:/data/musik:ro"
+#)
+#RADARR_EXTRA_VOLUMES=()
+#SONARR_EXTRA_VOLUMES=()
+
 # Usenet-Indexer automatisch in Prowlarr anlegen
 # Format: "Name|https://indexer.tld|APIKEY"
 #INDEXERS=(
