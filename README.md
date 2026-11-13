@@ -91,8 +91,39 @@ bash mediastack.sh update             # Images aktualisieren + geänderte Konfig
 bash mediastack.sh self-update        # neue Script-Version von GitHub holen, danach automatisch "update"
 bash mediastack.sh recreate jellyfin  # einzelne Container neu anlegen (mehrere möglich)
 bash mediastack.sh status             # Status der Container + Script-Version
+bash mediastack.sh doctor             # rclone-Mount prüfen, Reparatur mit Rückfrage
+bash mediastack.sh doctor --yes       # dasselbe ohne Rückfrage
+bash mediastack.sh watchdog pause     # Mount-Überwachung pausieren (resume = fortsetzen)
 bash mediastack.sh remove             # Container entfernen (Configs und Medien bleiben erhalten)
 ```
+
+## rclone-Mount: Diagnose, Reparatur und Watchdog
+
+`bash mediastack.sh doctor` prüft die ganze Kette der Reihe nach und hält beim ersten Fehler an:
+
+| # | Prüfung | Reparatur (nach Rückfrage) |
+|---|---|---|
+| 1 | InfiniDysk läuft und antwortet | starten bzw. neu starten |
+| 2 | WebDAV-Login (PROPFIND → 207) | Zugangsdaten neu eingeben, `rclone.conf` neu schreiben |
+| 3 | Container `rclone-nzbdav` läuft | rclone sauber neu starten |
+| 4 | rclone erreicht das WebDAV | `rclone.conf` aus `secrets.env` neu schreiben |
+| 5 | Mount im rclone-Container | rclone neu starten |
+| 6 | Mount auf dem Host, Mountpunkt *shared* | toten Mount aufräumen, Mountpunkt *shared* machen, rclone + Apps neu starten |
+| 7 | Mount in Radarr, Sonarr und Jellyfin sichtbar | betroffene Container neu starten |
+
+Nach jeder Reparatur beginnt die Prüfung von vorn. Nach höchstens 5 Durchläufen ist Schluss.
+
+**Watchdog:** Mit `WATCHDOG_ENABLED=true` (Standard) läuft dieselbe Prüfung alle 5 Minuten im Hintergrund und repariert ohne Rückfrage. Ist alles in Ordnung, passiert nichts. Reparaturen und Probleme landen im Unraid-Syslog:
+
+```bash
+grep mediastack /var/log/syslog
+```
+
+- Der Watchdog fragt nie nach Zugangsdaten und führt keine Installation aus. Solche Fälle meldet er nur im Syslog.
+- Läuft Docker nicht (Array gestoppt), tut er nichts. Zwei Läufe gleichzeitig verhindert ein Lock.
+- Für Wartungsarbeiten: `bash mediastack.sh watchdog pause`, danach `bash mediastack.sh watchdog resume`.
+
+**Cron unter Unraid:** `/etc/cron.d` liegt im RAM und ist nach jedem Neustart leer. Der Job steht deshalb in `/boot/config/plugins/mediastack/mediastack.cron`. Unraids `update_cron` übernimmt ihn nach `/etc/cron.d/root`, ausgelöst vom Script und beim Booten von der go-Datei. Abschalten: `WATCHDOG_ENABLED=false` in `mediastack.conf`, dann `bash mediastack.sh update`.
 
 ## TRaSH-Guides (deutsche Profile)
 
@@ -184,7 +215,7 @@ bash mediastack.sh recreate rclone-nzbdav prowlarr radarr sonarr jellyfin seerr
 - **Image von InfiniDysk:** Standard ist `ghcr.io/infinidysk/infinidysk:latest`. Bitte prüfen und bei Bedarf über `IMG_INFINIDYSK` anpassen.
 - **Mount-Propagation (Unraid-spezifisch):** rclone hängt das WebDAV *im* Container ein. Damit der Mount auf dem Host und in Radarr, Sonarr und Jellyfin ankommt, muss `/mnt/addons/nzbdav` ein *shared*-Mountpunkt sein, und zwar **bevor** Docker startet. Unraid hat kein systemd, das das von sich aus erledigt. Deshalb:
   - legt das Script einen Unraid-Event-Hook an (`disks_mounted`, läuft nach dem Einhängen der Platten und vor Docker), Quelle: `/boot/config/plugins/mediastack/mount-prep.sh`
-  - ergänzt einen markierten Block in `/boot/config/go` (`# >>> mediastack v2`), der den Hook bei jedem Boot installiert
+  - ergänzt einen markierten Block in `/boot/config/go` (`# >>> mediastack v3`), der den Hook bei jedem Boot installiert und den Watchdog-Cron lädt
   - prüft das Script bei jedem Lauf, ob der Mountpunkt *shared* ist. Wenn nicht, repariert es ihn und startet rclone, Radarr, Sonarr und Jellyfin neu.
 
   Zum Deinstallieren den Block aus der go-Datei und den Ordner `/boot/config/plugins/mediastack` entfernen.
@@ -198,8 +229,8 @@ bash mediastack.sh recreate rclone-nzbdav prowlarr radarr sonarr jellyfin seerr
 | Problem | Lösung |
 |---|---|
 | `Port … ist belegt` | Port in `mediastack.conf` ändern oder den anderen Container stoppen |
-| Mount nicht sichtbar | `docker logs rclone-nzbdav` · prüfen, ob `/dev/fuse` vorhanden ist · `grep nzbdav /proc/mounts` |
-| WebDAV liefert nicht 207 | Zugangsdaten falsch → Zeilen `WEBDAV_*` in `secrets.env` löschen und Script neu starten |
+| Mount leer / nicht sichtbar | `bash mediastack.sh doctor` |
+| WebDAV liefert nicht 207 | `bash mediastack.sh doctor` → Zugangsdaten neu eingeben |
 | Importe in Radarr/Sonarr schlagen fehl | Kategorien in InfiniDysk (`movies,tv`) und Rclone Mount Directory (`/mnt/nzbdav`) prüfen |
 | `.rclonelink`-Dateien statt Symlinks | rclone muss mit `--links` laufen (Standard im Script) |
 | Seerr nicht eingerichtet | Einrichtung unter `:5055` kurz manuell durchklicken, Jellyfin-Host `http://<server-ip>:8096` |

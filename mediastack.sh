@@ -12,13 +12,15 @@
 #    bash mediastack.sh self-update     -> Script von GitHub holen, danach "update"
 #    bash mediastack.sh recreate NAME.. -> einzelne Container neu anlegen
 #    bash mediastack.sh status          -> Container-Status anzeigen
+#    bash mediastack.sh doctor [--yes]  -> rclone-Mount prüfen + reparieren
+#    bash mediastack.sh watchdog pause|resume -> Mount-Überwachung pausieren
 #    bash mediastack.sh remove          -> Container entfernen (Daten bleiben!)
 #
 #  Eigene Werte: entweder unten im Block "KONFIGURATION" ändern oder eine Datei
 #  "mediastack.conf" neben das Script legen (wird automatisch geladen).
 # =============================================================================
 set -Eeuo pipefail
-SCRIPT_VERSION="1.3.0"
+SCRIPT_VERSION="1.4.0"
 REPO_RAW="https://raw.githubusercontent.com/kernelguru/unraid-media-stack-/main"
 
 # ------------------------------- KONFIGURATION -------------------------------
@@ -66,6 +68,10 @@ RECYCLARR_ENABLED=true
 TRASH_PROFILE="german-hd-bluray-web"
 RECYCLARR_SCHEDULE="@daily"          # automatischer Abgleich (Cron-Syntax)
 SEERR_USE_TRASH_PROFILE=true         # Seerr fordert mit dem TRaSH-Profil an
+
+# Watchdog: prüft den rclone-Mount alle 5 Minuten und repariert ihn still
+# (Meldungen im Unraid-Syslog unter "mediastack")
+WATCHDOG_ENABLED=true
 TEMPLATES_RAW="https://raw.githubusercontent.com/recyclarr/config-templates/master"
 
 # Zusätzliche Volumes pro Container ("host:container[:optionen]")
@@ -216,10 +222,173 @@ run_ct() {  # name webui-port icon-url -- docker-args...
 
 ICON="https://cdn.jsdelivr.net/gh/selfhst/icons/png"
 
+# ------------------------------- Mount-Diagnose / Reparatur ------------------
+detect_ip() {
+  [[ -n $SERVER_IP ]] || SERVER_IP=$(ip -4 route get 1.1.1.1 2>/dev/null \
+    | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')
+}
+
+write_rclone_conf() {
+  local dir="$APPDATA/rclone-nzbdav" obscured
+  mkdir -p "$dir/cache"
+  obscured=$(docker run --rm "$IMG_RCLONE" obscure "${WEBDAV_PASS:-}")
+  cat > "$dir/rclone.conf" <<EOF
+[nzbdav]
+type = webdav
+url = http://$SERVER_IP:$P_INFINIDYSK/
+vendor = other
+user = ${WEBDAV_USER:-}
+pass = $obscured
+EOF
+  chmod 600 "$dir/rclone.conf"
+}
+
+# Unraid: /etc/cron.d liegt im RAM. Dauerhaft sind nur *.cron-Dateien unter
+# /boot/config/plugins/<name>/, die update_cron nach /etc/cron.d/root übernimmt.
+CRON_FILE=/boot/config/plugins/mediastack/mediastack.cron
+install_watchdog() {
+  mkdir -p "$(dirname "$CRON_FILE")"
+  if [[ $WATCHDOG_ENABLED == true ]]; then
+    {
+      echo "# mediastack: rclone-Mount alle 5 Minuten prüfen und reparieren"
+      printf '*/5 * * * * [ -f %q ] && bash %q watchdog >/dev/null 2>&1\n' "$SELF" "$SELF"
+    } > "$CRON_FILE"
+    log "Watchdog aktiv (alle 5 Min., Log: grep mediastack /var/log/syslog)"
+  else
+    rm -f "$CRON_FILE"
+  fi
+  /usr/local/sbin/update_cron >/dev/null 2>&1 || true
+}
+
+DOC_AUTO=0    # 1 = ohne Rückfrage reparieren
+DOC_QUIET=0   # 1 = nur Syslog (Watchdog)
+dmsg() { if (( DOC_QUIET )); then logger -t mediastack "$*"; else echo "$*"; fi; }
+ok()   { (( DOC_QUIET )) || echo "  ${c_g}✔${c_0} $*"; }
+bad()  { if (( DOC_QUIET )); then logger -t mediastack "Problem: $*"; else echo "  ${c_r}✘${c_0} $*"; fi; }
+ask()  { (( DOC_AUTO )) && return 0; local a; read -rp "    → $*? [J/n] " a; [[ -z $a || $a =~ ^[jJyY] ]]; }
+running() { [[ $(docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null) == true ]]; }
+has_content() { grep -q 'completed-symlinks' <<<"$1"; }
+
+# Prüft die Kette InfiniDysk → WebDAV → rclone → Container-Mount → Host → Apps.
+# Beim ersten Fehler: FIX = Reparaturfunktion, FIX_DESC = Beschreibung.
+check_chain() {
+  FIX=""; FIX_DESC=""
+  local out code c broken=()
+
+  if ! exists infinidysk; then bad "Container infinidysk fehlt"; return 1; fi
+  if ! running infinidysk; then
+    bad "InfiniDysk läuft nicht"; FIX=fix_start_infinidysk; FIX_DESC="InfiniDysk starten"; return 1; fi
+  code=$(curl -s -o /dev/null -m 5 -w '%{http_code}' "$ND/" || true)
+  if [[ ! $code =~ ^[234] ]]; then
+    bad "InfiniDysk antwortet nicht (HTTP ${code:-–})"
+    FIX=fix_restart_infinidysk; FIX_DESC="InfiniDysk neu starten"; return 1; fi
+  ok "InfiniDysk erreichbar ($ND)"
+
+  code=$(curl -s -o /dev/null -m 10 -w '%{http_code}' -u "${WEBDAV_USER:-}:${WEBDAV_PASS:-}" \
+         -X PROPFIND -H 'Depth: 1' "$ND/" || true)
+  if [[ $code != 207 ]]; then
+    bad "WebDAV-Login fehlgeschlagen (HTTP $code)"
+    FIX=fix_new_creds; FIX_DESC="WebDAV-Zugangsdaten neu eingeben"; return 1; fi
+  ok "WebDAV-Login"
+
+  if ! exists rclone-nzbdav; then
+    bad "Container rclone-nzbdav fehlt"; FIX=fix_reinstall; FIX_DESC="Installation ausführen"; return 1; fi
+  if ! running rclone-nzbdav; then
+    bad "rclone-nzbdav läuft nicht"; FIX=fix_propagation; FIX_DESC="rclone-nzbdav starten"; return 1; fi
+  ok "rclone-nzbdav läuft"
+
+  if ! timeout 30 docker exec rclone-nzbdav rclone lsd nzbdav: --config /config/rclone/rclone.conf >/dev/null 2>&1; then
+    bad "rclone erreicht das WebDAV nicht (rclone.conf veraltet?)"
+    FIX=fix_rewrite_conf; FIX_DESC="rclone.conf neu schreiben und rclone neu starten"; return 1; fi
+  ok "rclone erreicht das WebDAV"
+
+  out=$(timeout 15 docker exec rclone-nzbdav ls -A "$MOUNT_CT" 2>&1 || true)
+  if ! has_content "$out"; then
+    bad "Kein Mount im rclone-Container"; FIX=fix_propagation; FIX_DESC="rclone-nzbdav neu starten"; return 1; fi
+  ok "Mount im rclone-Container"
+
+  if ! mountpoint -q "$MOUNT_HOST" \
+     || ! findmnt -no PROPAGATION --target "$MOUNT_HOST" 2>/dev/null | head -1 | grep -q shared; then
+    bad "$MOUNT_HOST ist nicht shared – Mount kommt nicht auf dem Host an"
+    FIX=fix_propagation; FIX_DESC="Mountpunkt shared machen, rclone + Radarr/Sonarr/Jellyfin neu starten"; return 1; fi
+  out=$(timeout 15 ls -A "$MOUNT_HOST" 2>&1 || true)
+  if ! has_content "$out"; then
+    bad "Mount auf dem Host leer oder tot"
+    FIX=fix_propagation; FIX_DESC="Mount aufräumen, rclone + Radarr/Sonarr/Jellyfin neu starten"; return 1; fi
+  ok "Mount auf dem Host ($MOUNT_HOST)"
+
+  for c in radarr sonarr jellyfin; do
+    exists "$c" && running "$c" || continue
+    out=$(timeout 15 docker exec "$c" ls -A "$MOUNT_CT" 2>&1 || true)
+    if has_content "$out"; then ok "Mount in $c"; else bad "Mount in $c leer"; broken+=("$c"); fi
+  done
+  if (( ${#broken[@]} )); then
+    FIX="fix_restart_apps ${broken[*]}"; FIX_DESC="${broken[*]} neu starten"; return 1; fi
+  return 0
+}
+
+wait_ct_mount() {
+  local i
+  for i in $(seq 1 20); do
+    timeout 10 docker exec rclone-nzbdav ls -A "$MOUNT_CT" 2>/dev/null | grep -q completed-symlinks && return 0
+    sleep 3
+  done
+  return 1
+}
+fix_start_infinidysk()   { docker start infinidysk >/dev/null && wait_http "$ND" 120 >/dev/null; }
+fix_restart_infinidysk() { docker restart infinidysk >/dev/null && wait_http "$ND" 120 >/dev/null; }
+fix_restart_apps() {
+  local c
+  for c; do exists "$c" && docker restart "$c" >/dev/null && dmsg "    $c neu gestartet"; done
+}
+# rclone sauber stoppen, Mountpunkt aufräumen + shared machen, rclone starten,
+# danach die Apps neu starten, damit sie den Mount sicher sehen
+fix_propagation() {
+  docker stop -t 30 rclone-nzbdav >/dev/null 2>&1 || true
+  prep_mount
+  docker start rclone-nzbdav >/dev/null || return 1
+  wait_ct_mount || { dmsg "    rclone hat nicht gemountet – docker logs rclone-nzbdav"; return 1; }
+  sleep 2
+  fix_restart_apps radarr sonarr jellyfin
+}
+fix_rewrite_conf() { write_rclone_conf && fix_propagation; }
+fix_new_creds() {
+  (( DOC_QUIET )) && return 1
+  read -rp  "    WebDAV-Benutzer: " WEBDAV_USER
+  read -rsp "    WebDAV-Passwort: " WEBDAV_PASS; echo
+  save_secret WEBDAV_USER "$WEBDAV_USER"; save_secret WEBDAV_PASS "$WEBDAV_PASS"
+  write_rclone_conf && fix_propagation
+}
+fix_reinstall() { (( DOC_QUIET )) && return 1; bash "$SELF" install; }
+
+run_doctor() {
+  detect_ip
+  ND="http://$SERVER_IP:$P_INFINIDYSK"
+  [[ -f $SECRETS ]] && source "$SECRETS"
+  local round
+  for round in 1 2 3 4 5; do
+    (( DOC_QUIET )) || echo "${c_b}── rclone-Mount: Prüfung $round ──${c_0}"
+    if check_chain; then
+      if (( DOC_QUIET )); then
+        (( round > 1 )) && logger -t mediastack "rclone-Mount repariert"
+      else
+        log "rclone-Mount ist in Ordnung."
+      fi
+      return 0
+    fi
+    if [[ -z $FIX ]]; then dmsg "Keine automatische Reparatur möglich."; return 1; fi
+    ask "$FIX_DESC" || return 1
+    dmsg "    Repariere: $FIX_DESC"
+    $FIX || { dmsg "    Reparatur fehlgeschlagen: $FIX_DESC"; return 1; }
+  done
+  dmsg "Nach 5 Durchläufen weiterhin fehlerhaft – docker logs rclone-nzbdav prüfen."
+  return 1
+}
+
 # ------------------------------- Sub-Kommandos -------------------------------
 SELF="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
 SELF_NAME="$(basename "$SELF")"
-usage() { sed -n '9,15p' "$SELF" | sed 's/^#//'; }
+usage() { sed -n '/^#  Aufruf/,/^#$/p' "$SELF" | sed 's/^#//'; }
 
 CMD=${1:-install}; shift || true
 APPLY=0; PULL=0
@@ -228,7 +397,26 @@ case "$CMD" in
     docker ps -a --filter "name=^($(IFS='|'; echo "${CONTAINERS[*]}"))$" \
       --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'
     echo "Script-Version: $SCRIPT_VERSION"; exit 0 ;;
+  doctor|diagnose)
+    [[ $EUID -eq 0 ]] || die "Bitte als root ausführen."
+    [[ ${1:-} == -y || ${1:-} == --yes ]] && DOC_AUTO=1
+    trap - ERR; set +e
+    run_doctor; exit $? ;;
+  watchdog)
+    case "${1:-run}" in
+      pause)  mkdir -p "$STATE_DIR"; touch "$STATE_DIR/watchdog.paused"; log "Watchdog pausiert"; exit 0 ;;
+      resume) rm -f "$STATE_DIR/watchdog.paused"; log "Watchdog wieder aktiv"; exit 0 ;;
+    esac
+    trap - ERR; set +e
+    [[ -f $STATE_DIR/watchdog.paused ]] && exit 0
+    docker info >/dev/null 2>&1 || exit 0          # Array/Docker gestoppt
+    exists rclone-nzbdav || exit 0
+    exec 9>/var/run/mediastack-watchdog.lock
+    flock -n 9 || exit 0                           # läuft schon
+    DOC_AUTO=1; DOC_QUIET=1
+    run_doctor; exit $? ;;
   remove)
+    rm -f "$CRON_FILE"; /usr/local/sbin/update_cron >/dev/null 2>&1 || true
     for c in "${CONTAINERS[@]}"; do exists "$c" && remove_ct "$c" && log "$c entfernt"; done
     log "Configs in $APPDATA und Medien in $DATA wurden NICHT gelöscht."; exit 0 ;;
   self-update)
@@ -317,14 +505,15 @@ EOF
 install -D -m 755 "$HOOK_SRC" "$HOOK_DST"
 
 GO=/boot/config/go
-if [[ -f $GO ]] && ! grep -q '# >>> mediastack v2' "$GO"; then
+if [[ -f $GO ]] && ! grep -q '# >>> mediastack v3' "$GO"; then
   log "Aktualisiere Boot-Eintrag in $GO"
   sed -i '/# >>> mediastack/,/# <<< mediastack/d' "$GO"
   cat >> "$GO" <<EOF
 
-# >>> mediastack v2 (rclone/InfiniDysk mount propagation)
+# >>> mediastack v3 (rclone/InfiniDysk mount propagation + Watchdog-Cron)
 install -D -m 755 $HOOK_SRC $HOOK_DST
 bash $HOOK_SRC
+/usr/local/sbin/update_cron
 # <<< mediastack
 EOF
 fi
@@ -395,16 +584,7 @@ code=$(curl -s -o /dev/null -w '%{http_code}' -u "$WEBDAV_USER:$WEBDAV_PASS" -X 
 
 # ------------------------------- 5. rclone-Mount -----------------------------
 RC_DIR="$APPDATA/rclone-nzbdav"
-OBSCURED=$(docker run --rm "$IMG_RCLONE" obscure "$WEBDAV_PASS")
-cat > "$RC_DIR/rclone.conf" <<EOF
-[nzbdav]
-type = webdav
-url = $ND/
-vendor = other
-user = $WEBDAV_USER
-pass = $OBSCURED
-EOF
-chmod 600 "$RC_DIR/rclone.conf"
+write_rclone_conf
 
 run_ct rclone-nzbdav "" "$ICON/rclone.png" -- \
   --cap-add SYS_ADMIN --device /dev/fuse --security-opt apparmor:unconfined \
@@ -710,6 +890,8 @@ else
   warn "  Seerr-Automatik fehlgeschlagen – Assistent unter $SE kurz manuell durchklicken (Jellyfin: $JF)."
 fi
 rm -f "$JAR"
+
+install_watchdog
 
 # ------------------------------- Fertig --------------------------------------
 cat <<EOF
