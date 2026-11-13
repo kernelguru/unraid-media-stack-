@@ -18,7 +18,7 @@
 #  "mediastack.conf" neben das Script legen (wird automatisch geladen).
 # =============================================================================
 set -Eeuo pipefail
-SCRIPT_VERSION="1.2.1"
+SCRIPT_VERSION="1.3.0"
 REPO_RAW="https://raw.githubusercontent.com/kernelguru/unraid-media-stack-/main"
 
 # ------------------------------- KONFIGURATION -------------------------------
@@ -131,11 +131,15 @@ prep_mount() {
     umount -l "$MOUNT_HOST" 2>/dev/null || fusermount -uz "$MOUNT_HOST" 2>/dev/null || true
   fi
   mkdir -p "$MOUNT_HOST"
-  if ! awk -v m="$MOUNT_HOST" '$2==m && /fuse/' /proc/mounts | grep -q .; then
+  # Ohne "shared" kommt der Mount aus dem rclone-Container nicht auf dem Host an
+  if ! mountpoint -q "$MOUNT_HOST" \
+     || ! findmnt -no PROPAGATION --target "$MOUNT_HOST" 2>/dev/null | head -1 | grep -q shared; then
     mountpoint -q "$MOUNT_HOST" || mount --bind "$MOUNT_HOST" "$MOUNT_HOST"
     mount --make-shared "$MOUNT_HOST"
+    MOUNT_FIXED=1
   fi
 }
+MOUNT_FIXED=0
 
 # HTTP-Aufruf mit Fehlertext statt stillem Scheitern
 # http METHOD URL [DATA] [extra curl args...]
@@ -293,15 +297,34 @@ chown -R 1000:1000 "$APPDATA/seerr"     # Seerr läuft als UID 1000
 # Damit der rclone-Mount aus dem Container auf dem Host und in den anderen
 # Containern sichtbar wird, muss der Mountpunkt "shared" sein.
 prep_mount
+# Neustartfest: Unraid führt Event-Skripte unter
+# /usr/local/emhttp/plugins/<name>/event/disks_mounted nach dem Einhängen der
+# Platten und VOR dem Start von Docker aus. Die go-Datei installiert den Hook
+# bei jedem Boot neu (das Verzeichnis liegt im RAM).
+HOOK_DIR=/boot/config/plugins/mediastack
+HOOK_SRC=$HOOK_DIR/mount-prep.sh
+HOOK_DST=/usr/local/emhttp/plugins/mediastack/event/disks_mounted
+mkdir -p "$HOOK_DIR"
+cat > "$HOOK_SRC" <<EOF
+#!/bin/bash
+# mediastack: Mountpunkt für den rclone-Container "shared" machen
+M="$MOUNT_HOST"
+mkdir -p "\$M"
+mountpoint -q "\$M" || mount --bind "\$M" "\$M"
+mount --make-shared "\$M"
+logger -t mediastack "Mountpunkt \$M vorbereitet (shared)"
+EOF
+install -D -m 755 "$HOOK_SRC" "$HOOK_DST"
+
 GO=/boot/config/go
-if [[ -f $GO ]] && ! grep -q '# >>> mediastack' "$GO"; then
-  log "Trage Mount-Vorbereitung in $GO ein (für Neustarts)"
+if [[ -f $GO ]] && ! grep -q '# >>> mediastack v2' "$GO"; then
+  log "Aktualisiere Boot-Eintrag in $GO"
+  sed -i '/# >>> mediastack/,/# <<< mediastack/d' "$GO"
   cat >> "$GO" <<EOF
 
-# >>> mediastack (rclone/InfiniDysk mount propagation)
-mkdir -p $MOUNT_HOST
-mountpoint -q $MOUNT_HOST || mount --bind $MOUNT_HOST $MOUNT_HOST
-mount --make-shared $MOUNT_HOST
+# >>> mediastack v2 (rclone/InfiniDysk mount propagation)
+install -D -m 755 $HOOK_SRC $HOOK_DST
+bash $HOOK_SRC
 # <<< mediastack
 EOF
 fi
@@ -397,6 +420,11 @@ run_ct rclone-nzbdav "" "$ICON/rclone.png" -- \
    --vfs-cache-mode full --vfs-cache-max-size $RCLONE_CACHE_SIZE --vfs-cache-max-age 24h \
    --cache-dir /cache"
 
+if (( MOUNT_FIXED )) && exists rclone-nzbdav; then
+  log "Mountpunkt war nicht shared – starte rclone-nzbdav neu"
+  docker restart -t 30 rclone-nzbdav >/dev/null
+fi
+
 printf '    warte auf rclone-Mount '
 for i in $(seq 1 40); do
   awk -v m="$MOUNT_HOST" '$2==m && /fuse/' /proc/mounts | grep -q . && { echo " ok"; break; }
@@ -407,6 +435,13 @@ for i in $(seq 1 40); do
     warn "Radarr/Sonarr/Jellyfin laufen weiter, Streams gehen aber erst mit Mount."
   fi
 done
+
+# Container, die vor der Korrektur liefen, sehen den Mount erst nach Neustart
+if (( MOUNT_FIXED )); then
+  for c in radarr sonarr jellyfin; do
+    exists "$c" && docker restart "$c" >/dev/null && log "$c neu gestartet (Mount)"
+  done
+fi
 
 # ------------------------------- 6. Apps starten -----------------------------
 run_ct prowlarr $P_PROWLARR "$ICON/prowlarr.png" -- \

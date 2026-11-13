@@ -182,7 +182,12 @@ bash mediastack.sh recreate rclone-nzbdav prowlarr radarr sonarr jellyfin seerr
 ## Wichtige Hinweise
 
 - **Image von InfiniDysk:** Standard ist `ghcr.io/infinidysk/infinidysk:latest`. Bitte prüfen und bei Bedarf über `IMG_INFINIDYSK` anpassen.
-- **`/boot/config/go`:** Das Script ergänzt dort einen markierten Block (`# >>> mediastack`). Er macht den Mountpunkt nach einem Neustart wieder *shared*, damit der rclone-Mount in den anderen Containern ankommt. Zum Deinstallieren den Block einfach löschen.
+- **Mount-Propagation (Unraid-spezifisch):** rclone hängt das WebDAV *im* Container ein. Damit der Mount auf dem Host und in Radarr, Sonarr und Jellyfin ankommt, muss `/mnt/addons/nzbdav` ein *shared*-Mountpunkt sein, und zwar **bevor** Docker startet. Unraid hat kein systemd, das das von sich aus erledigt. Deshalb:
+  - legt das Script einen Unraid-Event-Hook an (`disks_mounted`, läuft nach dem Einhängen der Platten und vor Docker), Quelle: `/boot/config/plugins/mediastack/mount-prep.sh`
+  - ergänzt einen markierten Block in `/boot/config/go` (`# >>> mediastack v2`), der den Hook bei jedem Boot installiert
+  - prüft das Script bei jedem Lauf, ob der Mountpunkt *shared* ist. Wenn nicht, repariert es ihn und startet rclone, Radarr, Sonarr und Jellyfin neu.
+
+  Zum Deinstallieren den Block aus der go-Datei und den Ordner `/boot/config/plugins/mediastack` entfernen.
 - **Netzwerk:** Die Container sprechen über `http://<server-ip>:<port>` miteinander statt über ein eigenes Docker-Netz, denn Unraid löscht eigene Netze standardmäßig beim Neustart von Docker. Der Server sollte deshalb eine **feste IP** haben.
 - **Keine Unraid-Vorlagen:** Die Container werden per `docker run` angelegt. Starten, Stoppen, Logs und WebUI funktionieren im Docker-Tab, *Edit* aber nicht. Änderungen deshalb in `mediastack.conf` vornehmen und `bash mediastack.sh update` ausführen.
 - **Bestehende Container:** Gibt es schon einen Container mit gleichem Namen (z. B. `jellyfin`), wird er nicht angefasst. Die Jellyfin-Automatik funktioniert dann nur, wenn Benutzer und Passwort übereinstimmen.
