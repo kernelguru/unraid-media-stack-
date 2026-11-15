@@ -5,7 +5,7 @@ Ein Script, das einen kompletten **Usenet-Streaming-Media-Stack** auf Unraid ins
 | App | Aufgabe | Port |
 |---|---|---|
 | **InfiniDysk** (NzbDAV-Fork) | Bindet NZBs als WebDAV ein, ohne sie herunterzuladen, und stellt eine SABnzbd-kompatible API bereit | 3000 |
-| **rclone** | Hängt das WebDAV von InfiniDysk ins Dateisystem ein | – |
+| **rclone** (Unraid-Plugin) | Hängt das WebDAV von InfiniDysk auf dem Host ein (`/mnt/addons/nzbdav`) | – |
 | **Prowlarr** | Verwaltet die Indexer und verteilt sie an Radarr/Sonarr | 9696 |
 | **Radarr** | Filme | 7878 |
 | **Sonarr** | Serien | 8989 |
@@ -97,6 +97,23 @@ bash mediastack.sh watchdog pause     # Mount-Überwachung pausieren (resume = f
 bash mediastack.sh remove             # Container entfernen (Configs und Medien bleiben erhalten)
 ```
 
+## rclone: Plugin oder Container
+
+Unter Unraid ist das **rclone-Plugin** aus den Community Apps ([Waseh/rclone-unraid](https://github.com/Waseh/rclone-unraid)) der zuverlässige Weg. rclone läuft dabei direkt auf dem Host, der Mount entsteht also genau dort, wo Radarr, Sonarr und Jellyfin ihn brauchen. Ein Mount, der in einem Container entsteht, kommt unter Unraid oft nicht auf dem Host an.
+
+**Standard: `RCLONE_MODE="plugin"`.** Das Script
+
+1. installiert das Plugin, falls es fehlt (`plugin install …/rclone.plg`, also genau wie über die Community Apps). Es erscheint danach normal unter *Plugins*.
+2. trägt das Remote `nzbdav` in die Plugin-Konfiguration `/boot/config/plugins/rclone/.rclone.conf` ein. Andere Remotes in der Datei bleiben unangetastet.
+3. hängt das WebDAV als Daemon unter `/mnt/addons/nzbdav` ein. Log: `appdata/mediastack/rclone.log`.
+4. hängt den Mount nach jedem Neustart automatisch wieder ein. Ein Unraid-Hook (`started`) wartet nach dem Array-Start auf InfiniDysk und mountet dann. Fällt der Mount später aus, holt ihn der Watchdog innerhalb von 5 Minuten zurück.
+
+Ein vorhandener Container `rclone-nzbdav` wird im Plugin-Modus entfernt.
+
+> Hast du das Plugin schon und hängst eigene Remotes per User Scripts ein, ist das kein Problem: Das Script nutzt nur das Remote `nzbdav` (änderbar über `RCLONE_REMOTE`). Hängt dein eigenes Skript **dasselbe** WebDAV ein, deaktiviere es, damit es nicht doppelt gemountet wird.
+
+**Alternative: `RCLONE_MODE="container"`.** rclone läuft dann im Container `rclone-nzbdav` (`--privileged --pid=host`, Mount per `nsenter` im Host-Namespace). Das ist nur sinnvoll, wenn du kein Plugin installieren willst.
+
 ## rclone-Mount: Diagnose, Reparatur und Watchdog
 
 `bash mediastack.sh doctor` prüft die ganze Kette der Reihe nach und hält beim ersten Fehler an:
@@ -105,10 +122,10 @@ bash mediastack.sh remove             # Container entfernen (Configs und Medien 
 |---|---|---|
 | 1 | InfiniDysk läuft und antwortet | starten bzw. neu starten |
 | 2 | WebDAV-Login (PROPFIND → 207) | Zugangsdaten neu eingeben, `rclone.conf` neu schreiben |
-| 3 | Container `rclone-nzbdav` läuft | rclone sauber neu starten |
-| 4 | rclone erreicht das WebDAV | `rclone.conf` aus `secrets.env` neu schreiben |
-| 5 | rclone-Container im Host-Modus (`--pid=host`) | Update ausführen, Container wird neu angelegt |
-| 6 | Mount auf dem Host, Mountpunkt *shared* | toten Mount aufräumen, Mountpunkt *shared* machen, rclone + Apps neu starten |
+| 3 | **Plugin:** Plugin installiert, kein alter Container parallel · **Container:** `rclone-nzbdav` läuft im Host-Modus | Plugin installieren bzw. alten Container entfernen · Container neu anlegen |
+| 4 | rclone erreicht das WebDAV | Remote bzw. `rclone.conf` aus `secrets.env` neu schreiben |
+| 5 | rclone-Mount läuft | Mount (neu) starten |
+| 6 | Mount auf dem Host mit Inhalt, Mountpunkt *shared* | toten Mount aufräumen, Mountpunkt *shared* machen, neu mounten, Apps neu starten |
 | 7 | Mount in Radarr, Sonarr und Jellyfin sichtbar | betroffene Container neu starten |
 
 Nach jeder Reparatur beginnt die Prüfung von vorn. Nach höchstens 5 Durchläufen ist Schluss.
@@ -213,10 +230,11 @@ bash mediastack.sh recreate rclone-nzbdav prowlarr radarr sonarr jellyfin seerr
 ## Wichtige Hinweise
 
 - **Image von InfiniDysk:** Standard ist `ghcr.io/infinidysk/infinidysk:latest`. Bitte prüfen und bei Bedarf über `IMG_INFINIDYSK` anpassen.
-- **rclone im Host-Namespace:** Unter Unraid kommt ein FUSE-Mount, der *im* Container entsteht, nicht zuverlässig auf dem Host an. Ab Version 1.5 läuft der Container `rclone-nzbdav` deshalb mit `--privileged --pid=host` und hängt das WebDAV per `nsenter` direkt im Mount-Namespace des Hosts ein. Der Container bleibt die Hülle: Starten, Stoppen, Logs und Updates laufen weiter über Docker.
+- **rclone:** siehe *rclone: Plugin oder Container*. Standard ist das Unraid-Plugin.
 - **Mount-Propagation (Unraid-spezifisch):** Damit der Mount in Radarr, Sonarr und Jellyfin ankommt, muss `/mnt/addons/nzbdav` ein *shared*-Mountpunkt sein, und zwar **bevor** Docker startet. Unraid hat kein systemd, das das von sich aus erledigt. Deshalb:
   - legt das Script einen Unraid-Event-Hook an (`disks_mounted`, läuft nach dem Einhängen der Platten und vor Docker), Quelle: `/boot/config/plugins/mediastack/mount-prep.sh`
-  - ergänzt einen markierten Block in `/boot/config/go` (`# >>> mediastack v3`), der den Hook bei jedem Boot installiert und den Watchdog-Cron lädt
+  - legt einen zweiten Hook an (`started`, läuft nach dem Start von Array und Docker), der den rclone-Mount einhängt, sobald InfiniDysk antwortet
+  - ergänzt einen markierten Block in `/boot/config/go` (`# >>> mediastack v4`), der beide Hooks bei jedem Boot installiert und den Watchdog-Cron lädt
   - prüft das Script bei jedem Lauf, ob der Mountpunkt *shared* ist. Wenn nicht, repariert es ihn und startet rclone, Radarr, Sonarr und Jellyfin neu.
 
   Zum Deinstallieren den Block aus der go-Datei und den Ordner `/boot/config/plugins/mediastack` entfernen.

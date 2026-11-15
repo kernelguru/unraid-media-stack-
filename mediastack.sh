@@ -20,7 +20,7 @@
 #  "mediastack.conf" neben das Script legen (wird automatisch geladen).
 # =============================================================================
 set -Eeuo pipefail
-SCRIPT_VERSION="1.5.0"
+SCRIPT_VERSION="1.6.0"
 REPO_RAW="https://raw.githubusercontent.com/kernelguru/unraid-media-stack-/main"
 
 # ------------------------------- KONFIGURATION -------------------------------
@@ -45,6 +45,15 @@ COUNTRY_CODE="DE"
 CAT_MOVIES="movies"                  # Kategorien in InfiniDysk (SABnzbd-Tab)
 CAT_TV="tv"
 RCLONE_CACHE_SIZE="50G"              # VFS-Cache für Streaming
+
+# Wie rclone läuft:
+#   plugin    = rclone-Plugin aus den Community Apps (Waseh), Mount direkt auf
+#               dem Host – unter Unraid der zuverlässige Weg (Standard)
+#   container = Docker-Container rclone-nzbdav (nsenter in den Host-Namespace)
+RCLONE_MODE="plugin"
+RCLONE_REMOTE="nzbdav"               # Remote-Name in der Plugin-Konfiguration
+RCLONE_PLG_URL="https://raw.githubusercontent.com/Waseh/rclone-unraid/master/plugin/rclone.plg"
+RCLONE_PLG_CONF="/boot/config/plugins/rclone/.rclone.conf"
 
 # Images
 IMG_INFINIDYSK="ghcr.io/infinidysk/infinidysk:latest"   # ggf. anpassen!
@@ -245,6 +254,61 @@ EOF
 
 # Unraid: /etc/cron.d liegt im RAM. Dauerhaft sind nur *.cron-Dateien unter
 # /boot/config/plugins/<name>/, die update_cron nach /etc/cron.d/root übernimmt.
+# ---- rclone über das Unraid-Plugin ------------------------------------------
+# Das Plugin installiert das echte Binary als /usr/sbin/rcloneorig und einen
+# Wrapper /usr/sbin/rclone, der immer --config $RCLONE_PLG_CONF setzt.
+RCLONE_BIN=/usr/sbin/rcloneorig
+prclone() { "$RCLONE_BIN" --config "$RCLONE_PLG_CONF" "$@"; }
+
+ensure_rclone_plugin() {
+  [[ -x $RCLONE_BIN ]] && return 0
+  log "Installiere rclone-Plugin (Community Apps, Waseh/rclone-unraid)"
+  if ! /usr/local/sbin/plugin install "$RCLONE_PLG_URL" >/tmp/mediastack-plugin.log 2>&1; then
+    tail -n 15 /tmp/mediastack-plugin.log | sed 's/^/      /' >&2
+    return 1
+  fi
+  [[ -x $RCLONE_BIN ]]
+}
+
+# Remote [$RCLONE_REMOTE] in der Plugin-Konfiguration anlegen/aktualisieren.
+# Andere Remotes in der Datei bleiben unangetastet.
+write_plugin_remote() {
+  local obs
+  mkdir -p "$(dirname "$RCLONE_PLG_CONF")"; touch "$RCLONE_PLG_CONF"
+  obs=$(prclone obscure "${WEBDAV_PASS:-}")
+  prclone config delete "$RCLONE_REMOTE" >/dev/null 2>&1 || true
+  prclone config create "$RCLONE_REMOTE" webdav \
+    url="http://$SERVER_IP:$P_INFINIDYSK/" vendor=other \
+    user="${WEBDAV_USER:-}" pass="$obs" --no-obscure >/dev/null
+}
+
+host_mounted() { awk -v m="$MOUNT_HOST" '$2==m && $3 ~ /^fuse/' /proc/mounts | grep -q .; }
+host_healthy() { host_mounted && timeout 15 ls -A "$MOUNT_HOST" 2>/dev/null | grep -q completed-symlinks; }
+host_unmount() {
+  host_mounted || return 0
+  fusermount -uz "$MOUNT_HOST" 2>/dev/null || fusermount3 -uz "$MOUNT_HOST" 2>/dev/null || umount -l "$MOUNT_HOST" 2>/dev/null || true
+  pkill -f "rcloneorig .*mount $RCLONE_REMOTE: $MOUNT_HOST" 2>/dev/null || true
+  sleep 1
+}
+
+# Mount mit dem Plugin-rclone als Daemon direkt auf dem Host
+host_mount() {
+  host_healthy && return 0
+  host_unmount
+  prep_mount
+  mkdir -p "$APPDATA/rclone-nzbdav/cache" "$STATE_DIR"
+  prclone mount "$RCLONE_REMOTE:" "$MOUNT_HOST" --daemon \
+    --allow-other --links --use-cookies \
+    --uid "$PUID" --gid "$PGID" --umask "$UMASK" \
+    --dir-cache-time 1s --buffer-size 32M \
+    --vfs-cache-mode full --vfs-cache-max-size "$RCLONE_CACHE_SIZE" --vfs-cache-max-age 24h \
+    --cache-dir "$APPDATA/rclone-nzbdav/cache" \
+    --log-file "$STATE_DIR/rclone.log" --log-level NOTICE || return 1
+  local i
+  for i in $(seq 1 20); do host_healthy && return 0; sleep 3; done
+  return 1
+}
+
 CRON_FILE=/boot/config/plugins/mediastack/mediastack.cron
 install_watchdog() {
   mkdir -p "$(dirname "$CRON_FILE")"
@@ -291,6 +355,22 @@ check_chain() {
     FIX=fix_new_creds; FIX_DESC="WebDAV-Zugangsdaten neu eingeben"; return 1; fi
   ok "WebDAV-Login"
 
+  if [[ $RCLONE_MODE == plugin ]]; then
+    if exists rclone-nzbdav; then
+      bad "Alter Container rclone-nzbdav läuft parallel zum Plugin"
+      FIX=fix_remove_rclone_ct; FIX_DESC="Container rclone-nzbdav entfernen und per Plugin mounten"; return 1; fi
+    if [[ ! -x $RCLONE_BIN ]]; then
+      bad "rclone-Plugin nicht installiert"
+      FIX=fix_install_plugin; FIX_DESC="rclone-Plugin aus den Community Apps installieren"; return 1; fi
+    ok "rclone-Plugin installiert ($("$RCLONE_BIN" version 2>/dev/null | head -1))"
+    if ! timeout 30 "$RCLONE_BIN" --config "$RCLONE_PLG_CONF" lsd "$RCLONE_REMOTE:" >/dev/null 2>&1; then
+      bad "Remote '$RCLONE_REMOTE:' erreicht das WebDAV nicht"
+      FIX=fix_rewrite_conf; FIX_DESC="Remote '$RCLONE_REMOTE' in der Plugin-Konfiguration neu schreiben und neu mounten"; return 1; fi
+    ok "Remote '$RCLONE_REMOTE:' erreicht das WebDAV"
+    if ! host_mounted; then
+      bad "rclone-Mount unter $MOUNT_HOST läuft nicht"
+      FIX=fix_mount; FIX_DESC="rclone-Mount starten, danach Radarr/Sonarr/Jellyfin neu starten"; return 1; fi
+  else
   if ! exists rclone-nzbdav; then
     bad "Container rclone-nzbdav fehlt"; FIX=fix_reinstall; FIX_DESC="Installation ausführen"; return 1; fi
   if ! running rclone-nzbdav; then
@@ -305,15 +385,16 @@ check_chain() {
   if [[ $(docker inspect -f '{{.HostConfig.PidMode}}' rclone-nzbdav 2>/dev/null) != host ]]; then
     bad "rclone-nzbdav ist noch im alten Modus (Mount nur im Container)"
     FIX=fix_reinstall; FIX_DESC="Update ausführen (rclone-nzbdav wird neu angelegt)"; return 1; fi
+  fi
 
   if ! mountpoint -q "$MOUNT_HOST" \
      || ! findmnt -no PROPAGATION --target "$MOUNT_HOST" 2>/dev/null | head -1 | grep -q shared; then
-    bad "$MOUNT_HOST ist nicht shared – Mount kommt nicht auf dem Host an"
-    FIX=fix_propagation; FIX_DESC="Mountpunkt shared machen, rclone + Radarr/Sonarr/Jellyfin neu starten"; return 1; fi
+    bad "$MOUNT_HOST ist nicht shared – Mount kommt nicht in den Containern an"
+    FIX=fix_mount; FIX_DESC="Mountpunkt shared machen, rclone + Radarr/Sonarr/Jellyfin neu starten"; return 1; fi
   out=$(timeout 15 ls -A "$MOUNT_HOST" 2>&1 || true)
   if ! has_content "$out"; then
     bad "Mount auf dem Host leer oder tot"
-    FIX=fix_propagation; FIX_DESC="Mount aufräumen, rclone + Radarr/Sonarr/Jellyfin neu starten"; return 1; fi
+    FIX=fix_mount; FIX_DESC="Mount aufräumen, rclone + Radarr/Sonarr/Jellyfin neu starten"; return 1; fi
   ok "Mount auf dem Host ($MOUNT_HOST)"
 
   for c in radarr sonarr jellyfin; do
@@ -350,13 +431,25 @@ fix_propagation() {
   sleep 2
   fix_restart_apps radarr sonarr jellyfin
 }
-fix_rewrite_conf() { write_rclone_conf && fix_propagation; }
+# Plugin-Modus: Mount neu aufbauen, dann Apps neu starten
+fix_host_mount() {
+  host_unmount
+  prep_mount
+  host_mount || { dmsg "    rclone-Mount fehlgeschlagen – Log: $STATE_DIR/rclone.log"; return 1; }
+  sleep 2
+  fix_restart_apps radarr sonarr jellyfin
+}
+fix_mount() { if [[ $RCLONE_MODE == plugin ]]; then fix_host_mount; else fix_propagation; fi; }
+write_conf() { if [[ $RCLONE_MODE == plugin ]]; then write_plugin_remote; else write_rclone_conf; fi; }
+fix_rewrite_conf() { write_conf && fix_mount; }
+fix_install_plugin() { (( DOC_QUIET )) && return 1; ensure_rclone_plugin && write_plugin_remote && fix_host_mount; }
+fix_remove_rclone_ct() { remove_ct rclone-nzbdav && fix_host_mount; }
 fix_new_creds() {
   (( DOC_QUIET )) && return 1
   read -rp  "    WebDAV-Benutzer: " WEBDAV_USER
   read -rsp "    WebDAV-Passwort: " WEBDAV_PASS; echo
   save_secret WEBDAV_USER "$WEBDAV_USER"; save_secret WEBDAV_PASS "$WEBDAV_PASS"
-  write_rclone_conf && fix_propagation
+  write_conf && fix_mount
 }
 fix_reinstall() { (( DOC_QUIET )) && return 1; bash "$SELF" update; }
 
@@ -408,14 +501,21 @@ case "$CMD" in
     esac
     trap - ERR; set +e
     [[ -f $STATE_DIR/watchdog.paused ]] && exit 0
+    if [[ ${1:-} == boot ]]; then                  # nach dem Array-Start: bis zu 10 Min. auf InfiniDysk warten
+      detect_ip
+      for i in $(seq 1 120); do
+        curl -s -o /dev/null -m 5 "http://$SERVER_IP:$P_INFINIDYSK/" && break; sleep 5
+      done
+    fi
     docker info >/dev/null 2>&1 || exit 0          # Array/Docker gestoppt
-    exists rclone-nzbdav || exit 0
+    exists infinidysk || exit 0
     exec 9>/var/run/mediastack-watchdog.lock
     flock -n 9 || exit 0                           # läuft schon
     DOC_AUTO=1; DOC_QUIET=1
     run_doctor; exit $? ;;
   remove)
     rm -f "$CRON_FILE"; /usr/local/sbin/update_cron >/dev/null 2>&1 || true
+    [[ $RCLONE_MODE == plugin ]] && host_unmount && log "rclone-Mount $MOUNT_HOST ausgehängt (Plugin bleibt installiert)"
     for c in "${CONTAINERS[@]}"; do exists "$c" && remove_ct "$c" && log "$c entfernt"; done
     log "Configs in $APPDATA und Medien in $DATA wurden NICHT gelöscht."; exit 0 ;;
   self-update)
@@ -503,14 +603,26 @@ logger -t mediastack "Mountpunkt \$M vorbereitet (shared)"
 EOF
 install -D -m 755 "$HOOK_SRC" "$HOOK_DST"
 
+# Hook "started": läuft, wenn Array und Docker oben sind. Startet den Watchdog
+# im Hintergrund; der wartet auf InfiniDysk und hängt dann den Mount ein.
+HOOK2_SRC=$HOOK_DIR/started.sh
+HOOK2_DST=/usr/local/emhttp/plugins/mediastack/event/started
+cat > "$HOOK2_SRC" <<EOF
+#!/bin/bash
+# mediastack: rclone-Mount nach dem Array-Start einhängen
+nohup bash "$SELF" watchdog boot >/dev/null 2>&1 &
+EOF
+install -D -m 755 "$HOOK2_SRC" "$HOOK2_DST"
+
 GO=/boot/config/go
-if [[ -f $GO ]] && ! grep -q '# >>> mediastack v3' "$GO"; then
+if [[ -f $GO ]] && ! grep -q '# >>> mediastack v4' "$GO"; then
   log "Aktualisiere Boot-Eintrag in $GO"
   sed -i '/# >>> mediastack/,/# <<< mediastack/d' "$GO"
   cat >> "$GO" <<EOF
 
-# >>> mediastack v3 (rclone/InfiniDysk mount propagation + Watchdog-Cron)
+# >>> mediastack v4 (rclone-Mount: Hooks + Watchdog-Cron)
 install -D -m 755 $HOOK_SRC $HOOK_DST
+install -D -m 755 $HOOK2_SRC $HOOK2_DST
 bash $HOOK_SRC
 /usr/local/sbin/update_cron
 # <<< mediastack
@@ -583,6 +695,20 @@ code=$(curl -s -o /dev/null -w '%{http_code}' -u "$WEBDAV_USER:$WEBDAV_PASS" -X 
 
 # ------------------------------- 5. rclone-Mount -----------------------------
 RC_DIR="$APPDATA/rclone-nzbdav"
+if [[ $RCLONE_MODE == plugin ]]; then
+  log "rclone über das Unraid-Plugin"
+  if exists rclone-nzbdav; then log "Entferne Container rclone-nzbdav (Plugin-Modus)"; remove_ct rclone-nzbdav; fi
+  ensure_rclone_plugin || die "rclone-Plugin konnte nicht installiert werden – Log: /tmp/mediastack-plugin.log"
+  log "  $("$RCLONE_BIN" version | head -1)"
+  write_plugin_remote
+  log "  Remote '$RCLONE_REMOTE' in $RCLONE_PLG_CONF eingetragen"
+  printf '    hänge %s ein ' "$MOUNT_HOST"
+  if host_mount; then echo " ok"
+  else
+    echo; warn "rclone-Mount fehlgeschlagen – Log: $STATE_DIR/rclone.log"
+    tail -n 10 "$STATE_DIR/rclone.log" 2>/dev/null | sed 's/^/      /' >&2 || true
+  fi
+else
 write_rclone_conf
 
 # Unraid: Die Mount-Propagation aus einem Container zurück auf den Host ist
@@ -620,6 +746,7 @@ for i in $(seq 1 40); do
     warn "Radarr/Sonarr/Jellyfin laufen weiter, Streams gehen aber erst mit Mount."
   fi
 done
+fi   # RCLONE_MODE
 
 # Container, die vor der Korrektur liefen, sehen den Mount erst nach Neustart
 if (( MOUNT_FIXED )); then

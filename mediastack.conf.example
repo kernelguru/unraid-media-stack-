@@ -21,6 +21,10 @@
 #CAT_TV="tv"
 #RCLONE_CACHE_SIZE="50G"
 
+# rclone: "plugin" (Unraid-Plugin aus den Community Apps, empfohlen) oder "container"
+#RCLONE_MODE="plugin"
+#RCLONE_REMOTE="nzbdav"
+
 # Image von InfiniDysk – bitte prüfen/anpassen
 #IMG_INFINIDYSK="ghcr.io/infinidysk/infinidysk:latest"
 
