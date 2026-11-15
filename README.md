@@ -107,7 +107,7 @@ bash mediastack.sh remove             # Container entfernen (Configs und Medien 
 | 2 | WebDAV-Login (PROPFIND → 207) | Zugangsdaten neu eingeben, `rclone.conf` neu schreiben |
 | 3 | Container `rclone-nzbdav` läuft | rclone sauber neu starten |
 | 4 | rclone erreicht das WebDAV | `rclone.conf` aus `secrets.env` neu schreiben |
-| 5 | Mount im rclone-Container | rclone neu starten |
+| 5 | rclone-Container im Host-Modus (`--pid=host`) | Update ausführen, Container wird neu angelegt |
 | 6 | Mount auf dem Host, Mountpunkt *shared* | toten Mount aufräumen, Mountpunkt *shared* machen, rclone + Apps neu starten |
 | 7 | Mount in Radarr, Sonarr und Jellyfin sichtbar | betroffene Container neu starten |
 
@@ -213,7 +213,8 @@ bash mediastack.sh recreate rclone-nzbdav prowlarr radarr sonarr jellyfin seerr
 ## Wichtige Hinweise
 
 - **Image von InfiniDysk:** Standard ist `ghcr.io/infinidysk/infinidysk:latest`. Bitte prüfen und bei Bedarf über `IMG_INFINIDYSK` anpassen.
-- **Mount-Propagation (Unraid-spezifisch):** rclone hängt das WebDAV *im* Container ein. Damit der Mount auf dem Host und in Radarr, Sonarr und Jellyfin ankommt, muss `/mnt/addons/nzbdav` ein *shared*-Mountpunkt sein, und zwar **bevor** Docker startet. Unraid hat kein systemd, das das von sich aus erledigt. Deshalb:
+- **rclone im Host-Namespace:** Unter Unraid kommt ein FUSE-Mount, der *im* Container entsteht, nicht zuverlässig auf dem Host an. Ab Version 1.5 läuft der Container `rclone-nzbdav` deshalb mit `--privileged --pid=host` und hängt das WebDAV per `nsenter` direkt im Mount-Namespace des Hosts ein. Der Container bleibt die Hülle: Starten, Stoppen, Logs und Updates laufen weiter über Docker.
+- **Mount-Propagation (Unraid-spezifisch):** Damit der Mount in Radarr, Sonarr und Jellyfin ankommt, muss `/mnt/addons/nzbdav` ein *shared*-Mountpunkt sein, und zwar **bevor** Docker startet. Unraid hat kein systemd, das das von sich aus erledigt. Deshalb:
   - legt das Script einen Unraid-Event-Hook an (`disks_mounted`, läuft nach dem Einhängen der Platten und vor Docker), Quelle: `/boot/config/plugins/mediastack/mount-prep.sh`
   - ergänzt einen markierten Block in `/boot/config/go` (`# >>> mediastack v3`), der den Hook bei jedem Boot installiert und den Watchdog-Cron lädt
   - prüft das Script bei jedem Lauf, ob der Mountpunkt *shared* ist. Wenn nicht, repariert es ihn und startet rclone, Radarr, Sonarr und Jellyfin neu.

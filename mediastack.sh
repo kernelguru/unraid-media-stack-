@@ -20,7 +20,7 @@
 #  "mediastack.conf" neben das Script legen (wird automatisch geladen).
 # =============================================================================
 set -Eeuo pipefail
-SCRIPT_VERSION="1.4.0"
+SCRIPT_VERSION="1.5.0"
 REPO_RAW="https://raw.githubusercontent.com/kernelguru/unraid-media-stack-/main"
 
 # ------------------------------- KONFIGURATION -------------------------------
@@ -302,10 +302,9 @@ check_chain() {
     FIX=fix_rewrite_conf; FIX_DESC="rclone.conf neu schreiben und rclone neu starten"; return 1; fi
   ok "rclone erreicht das WebDAV"
 
-  out=$(timeout 15 docker exec rclone-nzbdav ls -A "$MOUNT_CT" 2>&1 || true)
-  if ! has_content "$out"; then
-    bad "Kein Mount im rclone-Container"; FIX=fix_propagation; FIX_DESC="rclone-nzbdav neu starten"; return 1; fi
-  ok "Mount im rclone-Container"
+  if [[ $(docker inspect -f '{{.HostConfig.PidMode}}' rclone-nzbdav 2>/dev/null) != host ]]; then
+    bad "rclone-nzbdav ist noch im alten Modus (Mount nur im Container)"
+    FIX=fix_reinstall; FIX_DESC="Update ausführen (rclone-nzbdav wird neu angelegt)"; return 1; fi
 
   if ! mountpoint -q "$MOUNT_HOST" \
      || ! findmnt -no PROPAGATION --target "$MOUNT_HOST" 2>/dev/null | head -1 | grep -q shared; then
@@ -330,7 +329,7 @@ check_chain() {
 wait_ct_mount() {
   local i
   for i in $(seq 1 20); do
-    timeout 10 docker exec rclone-nzbdav ls -A "$MOUNT_CT" 2>/dev/null | grep -q completed-symlinks && return 0
+    timeout 10 ls -A "$MOUNT_HOST" 2>/dev/null | grep -q completed-symlinks && return 0
     sleep 3
   done
   return 1
@@ -359,7 +358,7 @@ fix_new_creds() {
   save_secret WEBDAV_USER "$WEBDAV_USER"; save_secret WEBDAV_PASS "$WEBDAV_PASS"
   write_rclone_conf && fix_propagation
 }
-fix_reinstall() { (( DOC_QUIET )) && return 1; bash "$SELF" install; }
+fix_reinstall() { (( DOC_QUIET )) && return 1; bash "$SELF" update; }
 
 run_doctor() {
   detect_ip
@@ -586,19 +585,25 @@ code=$(curl -s -o /dev/null -w '%{http_code}' -u "$WEBDAV_USER:$WEBDAV_PASS" -X 
 RC_DIR="$APPDATA/rclone-nzbdav"
 write_rclone_conf
 
+# Unraid: Die Mount-Propagation aus einem Container zurück auf den Host ist
+# unzuverlässig. Deshalb hängt rclone direkt im Mount-Namespace des Hosts ein
+# (nsenter -t 1 -m). Der Container bleibt nur die Hülle: Start/Stopp/Logs/Update
+# laufen weiter über Docker. Das Netzwerk bleibt das des Containers.
+RCLONE_HOST_CMD="cp $RC_DIR/rclone.bin /tmp/mediastack-rclone && chmod 755 /tmp/mediastack-rclone; \
+  if mountpoint -q $MOUNT_HOST && grep -q ' $MOUNT_HOST fuse' /proc/mounts && ! ls $MOUNT_HOST >/dev/null 2>&1; then umount -l $MOUNT_HOST; fi; \
+  exec /tmp/mediastack-rclone mount nzbdav: $MOUNT_HOST --config $RC_DIR/rclone.conf \
+  --allow-other --links --use-cookies \
+  --uid $PUID --gid $PGID --umask $UMASK \
+  --dir-cache-time 1s --buffer-size 32M \
+  --vfs-cache-mode full --vfs-cache-max-size $RCLONE_CACHE_SIZE --vfs-cache-max-age 24h \
+  --cache-dir $RC_DIR/cache"
 run_ct rclone-nzbdav "" "$ICON/rclone.png" -- \
-  --cap-add SYS_ADMIN --device /dev/fuse --security-opt apparmor:unconfined \
+  --privileged --pid=host \
   -v "$RC_DIR:/config/rclone" \
-  -v "$RC_DIR/cache:/cache" \
-  -v "$MOUNT_HOST:$MOUNT_CT:rshared" \
   --entrypoint sh "$IMG_RCLONE" -c \
-  "fusermount3 -uz $MOUNT_CT 2>/dev/null; fusermount -uz $MOUNT_CT 2>/dev/null; \
-   exec rclone mount nzbdav: $MOUNT_CT --config /config/rclone/rclone.conf \
-   --allow-other --links --use-cookies \
-   --uid $PUID --gid $PGID --umask $UMASK \
-   --dir-cache-time 1s --buffer-size 32M \
-   --vfs-cache-mode full --vfs-cache-max-size $RCLONE_CACHE_SIZE --vfs-cache-max-age 24h \
-   --cache-dir /cache"
+  "set -e; command -v nsenter >/dev/null || apk add --no-cache util-linux-misc >/dev/null; \
+   cp /usr/local/bin/rclone /config/rclone/rclone.bin; \
+   exec nsenter -t 1 -m -- /bin/sh -c \"$RCLONE_HOST_CMD\""
 
 if (( MOUNT_FIXED )) && exists rclone-nzbdav; then
   log "Mountpunkt war nicht shared – starte rclone-nzbdav neu"
