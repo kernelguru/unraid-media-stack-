@@ -114,6 +114,31 @@ Ein vorhandener Container `rclone-nzbdav` wird im Plugin-Modus entfernt.
 
 **Alternative: `RCLONE_MODE="container"`.** rclone läuft dann im Container `rclone-nzbdav` (`--privileged --pid=host`, Mount per `nsenter` im Host-Namespace). Das ist nur sinnvoll, wenn du kein Plugin installieren willst.
 
+## rclone-Einstellungen (nach InfiniDysk-Doku)
+
+Die Mount-Optionen folgen dem InfiniDysk-Guide *Mount WebDAV with rclone*:
+
+| Option | Wert | Warum |
+|---|---|---|
+| `--links` | – | `.rclonelink` → echte Symlinks |
+| `--use-cookies` | – | keine erneute Anmeldung bei jeder Anfrage |
+| `--vfs-cache-mode` | `full` | Lese-Cache auf der Platte, flüssiges Spulen |
+| `--vfs-cache-max-size` | `50G` (`RCLONE_CACHE_SIZE`) | Obergrenze des Caches |
+| `--vfs-cache-max-age` | `1w` (`RCLONE_CACHE_MAX_AGE`) | wie lange Cache-Daten bleiben |
+| `--buffer-size` | `0` | kein doppeltes Puffern neben dem VFS-Cache |
+| `--vfs-read-ahead` | `512M` (`RCLONE_READ_AHEAD`) | Vorlauf für Bitraten-Spitzen |
+| `--dir-cache-time` | `20s`, mit RC `1w` + `--poll-interval=0` | aktuelle Verzeichnislisten |
+
+Der Cache liegt in `appdata/rclone-nzbdav/cache`. Ändert sich eine Einstellung, hängt `update` den Mount automatisch neu ein.
+
+**Backend-Port statt Port 3000:** Laut Doku soll rclone das WebDAV direkt über den Backend-Port **8080** von InfiniDysk ansprechen. Port 3000 ist der Proxy der Weboberfläche: langsamer beim Streaming, und InfiniDysk zeigt dann eine Warnung an. Das Script veröffentlicht Port 8080 als `127.0.0.1:18080` (`P_WEBDAV`), also nur für den Host und nicht im LAN, und nutzt ihn automatisch. Hast du InfiniDysk selbst angelegt (eigene Unraid-Vorlage), füge dort einen Port hinzu: Container-Port `8080` → Host-Port `18080`. `doctor` zeigt, welcher Weg aktiv ist, und stellt rclone bei Bedarf um.
+
+**Segment Cache:** Bei Symlink-Bibliotheken übernimmt rclone das Caching, deshalb sollte der Segment Cache in InfiniDysk aus sein (*Settings → Streaming*). Bei vom Script angelegtem InfiniDysk setzt es das per `NZBDAV_CONFIG__USENET__SEGMENT_CACHE__ENABLED=false`.
+
+**RC-Benachrichtigungen (optional, `RCLONE_RC=true`):** InfiniDysk meldet neue und entfernte Dateien direkt an rclone (`vfs/forget`). Dann darf der Verzeichnis-Cache eine Woche gelten, das bedeutet weniger WebDAV-Anfragen. rclone lauscht dafür auf Port 5572 (Benutzer `rclone`, Passwort `RC_PASS` in `secrets.env`). Hat das Script InfiniDysk angelegt, trägt es die RC-Daten per Umgebungsvariablen ein. Sonst trägst du sie selbst ein, unter *Settings → Rclone Server*: Notifications an, Host `http://<server-ip>:5572`, Benutzer und Passwort, dann **Test**. Erst danach `RCLONE_RC=true` setzen, sonst sieht rclone neue Dateien bis zu einer Woche lang nicht.
+
+> **Jellyfin und STRM:** InfiniDysk empfiehlt für Emby und Jellyfin eigentlich STRM-Dateien statt Symlinks. Der Nachteil laut Doku: Jellyfin zeigt dann Laufzeit und Tonspuren erst nach dem ersten Abspielen. Dieser Stack nutzt Symlinks mit rclone-Mount, die Doku nennt das als gleichwertige Alternative.
+
 ## rclone-Mount: Diagnose, Reparatur und Watchdog
 
 `bash mediastack.sh doctor` prüft die ganze Kette der Reihe nach und hält beim ersten Fehler an:

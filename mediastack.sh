@@ -20,7 +20,7 @@
 #  "mediastack.conf" neben das Script legen (wird automatisch geladen).
 # =============================================================================
 set -Eeuo pipefail
-SCRIPT_VERSION="1.6.0"
+SCRIPT_VERSION="1.7.0"
 REPO_RAW="https://raw.githubusercontent.com/kernelguru/unraid-media-stack-/main"
 
 # ------------------------------- KONFIGURATION -------------------------------
@@ -44,7 +44,18 @@ COUNTRY_CODE="DE"
 
 CAT_MOVIES="movies"                  # Kategorien in InfiniDysk (SABnzbd-Tab)
 CAT_TV="tv"
-RCLONE_CACHE_SIZE="50G"              # VFS-Cache für Streaming
+# rclone-Mount nach InfiniDysk-Doku (Guide "Mount WebDAV with rclone")
+RCLONE_CACHE_SIZE="50G"              # --vfs-cache-max-size
+RCLONE_CACHE_MAX_AGE="1w"            # --vfs-cache-max-age
+RCLONE_READ_AHEAD="512M"             # --vfs-read-ahead (Puffer für hohe Bitraten)
+# RC-Benachrichtigungen: InfiniDysk meldet neue/entfernte Dateien per
+# vfs/forget an rclone. Dann darf der Verzeichnis-Cache lang sein (1w statt 20s).
+# Nur einschalten, wenn InfiniDysk die RC-Daten auch kennt (s. README).
+RCLONE_RC=false
+P_RCLONE_RC=5572
+# WebDAV über den Backend-Port 8080 von InfiniDysk (schneller als Port 3000).
+# Host-Port, nur an 127.0.0.1 gebunden (rclone läuft auf dem Host).
+P_WEBDAV=18080
 
 # Wie rclone läuft:
 #   plugin    = rclone-Plugin aus den Community Apps (Waseh), Mount direkt auf
@@ -237,6 +248,42 @@ detect_ip() {
     | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')
 }
 
+# WebDAV-URL wählen: Backend-Port (empfohlen) oder Frontend-Port 3000 als Fallback
+detect_dav() {
+  local code
+  code=$(curl -s -o /dev/null -m 5 -w '%{http_code}' -X PROPFIND -H 'Depth: 0' \
+         "http://127.0.0.1:$P_WEBDAV/" 2>/dev/null || true)
+  if [[ $code =~ ^[2-4][0-9][0-9]$ ]]; then
+    DAV_URL="http://127.0.0.1:$P_WEBDAV/"; DAV_BACKEND=1
+  else
+    DAV_URL="http://$SERVER_IP:$P_INFINIDYSK/"; DAV_BACKEND=0
+  fi
+}
+
+# Mount-Flags laut InfiniDysk-Doku; mit RC: langer Verzeichnis-Cache
+build_rclone_flags() {
+  RCLONE_FLAGS=(--allow-other --links --use-cookies
+    --uid="$PUID" --gid="$PGID" --umask="$UMASK"
+    --vfs-cache-mode=full --vfs-cache-max-size="$RCLONE_CACHE_SIZE"
+    --vfs-cache-max-age="$RCLONE_CACHE_MAX_AGE" --buffer-size=0
+    --vfs-read-ahead="$RCLONE_READ_AHEAD")
+  if [[ $RCLONE_RC == true ]]; then
+    RCLONE_FLAGS+=(--dir-cache-time=1w --poll-interval=0
+      --rc --rc-addr=":$P_RCLONE_RC" --rc-user=rclone --rc-pass="${RC_PASS:-}")
+  else
+    RCLONE_FLAGS+=(--dir-cache-time=20s)
+  fi
+}
+
+# Aktuell eingetragene WebDAV-URL des rclone-Remotes
+conf_url() {
+  if [[ $RCLONE_MODE == plugin ]]; then
+    "$RCLONE_BIN" --config "$RCLONE_PLG_CONF" config show "$RCLONE_REMOTE" 2>/dev/null | sed -n 's/^url *= *//p'
+  else
+    sed -n 's/^url *= *//p' "$APPDATA/rclone-nzbdav/rclone.conf" 2>/dev/null
+  fi
+}
+
 write_rclone_conf() {
   local dir="$APPDATA/rclone-nzbdav" obscured
   mkdir -p "$dir/cache"
@@ -244,7 +291,7 @@ write_rclone_conf() {
   cat > "$dir/rclone.conf" <<EOF
 [nzbdav]
 type = webdav
-url = http://$SERVER_IP:$P_INFINIDYSK/
+url = ${DAV_URL:-http://$SERVER_IP:$P_INFINIDYSK/}
 vendor = other
 user = ${WEBDAV_USER:-}
 pass = $obscured
@@ -278,7 +325,7 @@ write_plugin_remote() {
   obs=$(prclone obscure "${WEBDAV_PASS:-}")
   prclone config delete "$RCLONE_REMOTE" >/dev/null 2>&1 || true
   prclone config create "$RCLONE_REMOTE" webdav \
-    url="http://$SERVER_IP:$P_INFINIDYSK/" vendor=other \
+    url="${DAV_URL:-http://$SERVER_IP:$P_INFINIDYSK/}" vendor=other \
     user="${WEBDAV_USER:-}" pass="$obs" --no-obscure >/dev/null
 }
 
@@ -293,15 +340,16 @@ host_unmount() {
 
 # Mount mit dem Plugin-rclone als Daemon direkt auf dem Host
 host_mount() {
-  host_healthy && return 0
+  build_rclone_flags
+  # Fingerabdruck aus URL + Flags: geänderte Einstellungen -> neu mounten
+  local sig; sig=$(printf '%s ' "${DAV_URL:-}" "${RCLONE_FLAGS[@]}" | md5sum | cut -c1-12)
+  if host_healthy && [[ $(cat "$STATE_DIR/mount.sig" 2>/dev/null) == "$sig" ]]; then return 0; fi
+  MOUNT_FIXED=1
   host_unmount
   prep_mount
   mkdir -p "$APPDATA/rclone-nzbdav/cache" "$STATE_DIR"
-  prclone mount "$RCLONE_REMOTE:" "$MOUNT_HOST" --daemon \
-    --allow-other --links --use-cookies \
-    --uid "$PUID" --gid "$PGID" --umask "$UMASK" \
-    --dir-cache-time 1s --buffer-size 32M \
-    --vfs-cache-mode full --vfs-cache-max-size "$RCLONE_CACHE_SIZE" --vfs-cache-max-age 24h \
+  echo "$sig" > "$STATE_DIR/mount.sig" 2>/dev/null || true
+  prclone mount "$RCLONE_REMOTE:" "$MOUNT_HOST" --daemon "${RCLONE_FLAGS[@]}" \
     --cache-dir "$APPDATA/rclone-nzbdav/cache" \
     --log-file "$STATE_DIR/rclone.log" --log-level NOTICE || return 1
   local i
@@ -348,12 +396,20 @@ check_chain() {
     FIX=fix_restart_infinidysk; FIX_DESC="InfiniDysk neu starten"; return 1; fi
   ok "InfiniDysk erreichbar ($ND)"
 
+  detect_dav
   code=$(curl -s -o /dev/null -m 10 -w '%{http_code}' -u "${WEBDAV_USER:-}:${WEBDAV_PASS:-}" \
-         -X PROPFIND -H 'Depth: 1' "$ND/" || true)
+         -X PROPFIND -H 'Depth: 1' "$DAV_URL" || true)
   if [[ $code != 207 ]]; then
     bad "WebDAV-Login fehlgeschlagen (HTTP $code)"
     FIX=fix_new_creds; FIX_DESC="WebDAV-Zugangsdaten neu eingeben"; return 1; fi
-  ok "WebDAV-Login"
+  if (( DAV_BACKEND )); then ok "WebDAV-Login (Backend-Port $P_WEBDAV)"
+  else
+    ok "WebDAV-Login (Port $P_INFINIDYSK)"
+    (( DOC_QUIET )) || echo "  ${c_y}!${c_0} WebDAV läuft über den Frontend-Proxy (langsamer). Empfohlen: InfiniDysk-Port 8080 als Host-Port $P_WEBDAV veröffentlichen."
+  fi
+  if [[ $(conf_url) != "$DAV_URL" && -n $(conf_url) ]]; then
+    bad "rclone nutzt $(conf_url), erwartet $DAV_URL"
+    FIX=fix_rewrite_conf; FIX_DESC="rclone auf $DAV_URL umstellen und neu mounten"; return 1; fi
 
   if [[ $RCLONE_MODE == plugin ]]; then
     if exists rclone-nzbdav; then
@@ -571,6 +627,7 @@ if [[ -z $ADMIN_PASS ]]; then
   done
 fi
 save_secret ADMIN_USER "$ADMIN_USER"; save_secret ADMIN_PASS "$ADMIN_PASS"
+[[ -n ${RC_PASS:-} ]] || { RC_PASS=$(genkey); save_secret RC_PASS "$RC_PASS"; }
 
 # ------------------------------- 1. Ordner -----------------------------------
 log "Lege Ordner an"
@@ -661,8 +718,17 @@ seed_arr sonarr   $P_SONARR
 LSIO_ENV=(-e PUID="$PUID" -e PGID="$PGID" -e UMASK="$UMASK")
 
 # ------------------------------- 4. InfiniDysk -------------------------------
+# Symlink-Bibliothek: Caching macht rclone (VFS), Segment Cache von InfiniDysk aus
+ND_ENV=(-e NZBDAV_CONFIG__USENET__SEGMENT_CACHE__ENABLED=false)
+if [[ $RCLONE_RC == true ]]; then
+  ND_ENV+=(-e NZBDAV_CONFIG__RCLONE__RC_ENABLED=true
+           -e "NZBDAV_CONFIG__RCLONE__HOST=http://$SERVER_IP:$P_RCLONE_RC"
+           -e NZBDAV_CONFIG__RCLONE__USER=rclone
+           -e "NZBDAV_CONFIG__RCLONE__PASS=$RC_PASS")
+fi
 run_ct infinidysk $P_INFINIDYSK "" -- \
-  "${LSIO_ENV[@]}" -p $P_INFINIDYSK:3000 \
+  "${LSIO_ENV[@]}" "${ND_ENV[@]}" \
+  -p $P_INFINIDYSK:3000 -p "127.0.0.1:$P_WEBDAV:8080" \
   -v "$APPDATA/infinidysk:/config" \
   "$IMG_INFINIDYSK"
 
@@ -690,7 +756,19 @@ EOF
   save_secret WEBDAV_PASS "$WEBDAV_PASS"
 fi
 
-code=$(curl -s -o /dev/null -w '%{http_code}' -u "$WEBDAV_USER:$WEBDAV_PASS" -X PROPFIND -H 'Depth: 1' "$ND/" || true)
+detect_dav
+if (( DAV_BACKEND )); then
+  log "WebDAV über Backend-Port: $DAV_URL"
+else
+  warn "WebDAV läuft über Port $P_INFINIDYSK (Frontend-Proxy, langsamer)."
+  warn "  Empfohlen: in InfiniDysk Container-Port 8080 als Host-Port $P_WEBDAV veröffentlichen"
+  warn "  (wird vom Script automatisch gemacht, wenn es InfiniDysk selbst angelegt hat)."
+fi
+if [[ $RCLONE_RC == true ]] && ! docker inspect -f '{{index .Config.Labels "mediastack.hash"}}' infinidysk 2>/dev/null | grep -qv '<no value>'; then
+  warn "RCLONE_RC=true: Bitte in InfiniDysk unter Settings → Rclone Server eintragen:"
+  warn "  Notifications an · Host http://$SERVER_IP:$P_RCLONE_RC · User rclone · Passwort: RC_PASS aus $SECRETS"
+fi
+code=$(curl -s -o /dev/null -w '%{http_code}' -u "$WEBDAV_USER:$WEBDAV_PASS" -X PROPFIND -H 'Depth: 1' "$DAV_URL" || true)
 [[ $code == 207 ]] || warn "WebDAV-Login liefert HTTP $code (erwartet 207) – Zugangsdaten prüfen. Werte in $SECRETS löschen und Script neu starten."
 
 # ------------------------------- 5. rclone-Mount -----------------------------
@@ -715,16 +793,13 @@ write_rclone_conf
 # unzuverlässig. Deshalb hängt rclone direkt im Mount-Namespace des Hosts ein
 # (nsenter -t 1 -m). Der Container bleibt nur die Hülle: Start/Stopp/Logs/Update
 # laufen weiter über Docker. Das Netzwerk bleibt das des Containers.
+build_rclone_flags
 RCLONE_HOST_CMD="cp $RC_DIR/rclone.bin /tmp/mediastack-rclone && chmod 755 /tmp/mediastack-rclone; \
   if mountpoint -q $MOUNT_HOST && grep -q ' $MOUNT_HOST fuse' /proc/mounts && ! ls $MOUNT_HOST >/dev/null 2>&1; then umount -l $MOUNT_HOST; fi; \
   exec /tmp/mediastack-rclone mount nzbdav: $MOUNT_HOST --config $RC_DIR/rclone.conf \
-  --allow-other --links --use-cookies \
-  --uid $PUID --gid $PGID --umask $UMASK \
-  --dir-cache-time 1s --buffer-size 32M \
-  --vfs-cache-mode full --vfs-cache-max-size $RCLONE_CACHE_SIZE --vfs-cache-max-age 24h \
-  --cache-dir $RC_DIR/cache"
+  ${RCLONE_FLAGS[*]} --cache-dir $RC_DIR/cache"
 run_ct rclone-nzbdav "" "$ICON/rclone.png" -- \
-  --privileged --pid=host \
+  --privileged --pid=host --network host \
   -v "$RC_DIR:/config/rclone" \
   --entrypoint sh "$IMG_RCLONE" -c \
   "set -e; command -v nsenter >/dev/null || apk add --no-cache util-linux-misc >/dev/null; \

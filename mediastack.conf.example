@@ -20,6 +20,10 @@
 #CAT_MOVIES="movies"
 #CAT_TV="tv"
 #RCLONE_CACHE_SIZE="50G"
+#RCLONE_CACHE_MAX_AGE="1w"
+#RCLONE_READ_AHEAD="512M"
+#RCLONE_RC=false          # erst true, wenn InfiniDysk die RC-Daten kennt (README)
+#P_WEBDAV=18080           # Host-Port für den InfiniDysk-Backend-Port 8080
 
 # rclone: "plugin" (Unraid-Plugin aus den Community Apps, empfohlen) oder "container"
 #RCLONE_MODE="plugin"
