@@ -20,7 +20,7 @@
 #  "mediastack.conf" neben das Script legen (wird automatisch geladen).
 # =============================================================================
 set -Eeuo pipefail
-SCRIPT_VERSION="1.7.0"
+SCRIPT_VERSION="1.7.1"
 REPO_RAW="https://raw.githubusercontent.com/kernelguru/unraid-media-stack-/main"
 
 # ------------------------------- KONFIGURATION -------------------------------
@@ -262,7 +262,10 @@ detect_dav() {
 
 # Mount-Flags laut InfiniDysk-Doku; mit RC: langer Verzeichnis-Cache
 build_rclone_flags() {
-  RCLONE_FLAGS=(--allow-other --links --use-cookies
+  # --allow-non-empty: Der Mountpunkt ist ein shared-Bind-Mount (für die
+  # Propagation in die Container). Neuere rclone-Versionen verweigern sonst
+  # mit "directory already mounted".
+  RCLONE_FLAGS=(--allow-other --allow-non-empty --links --use-cookies
     --uid="$PUID" --gid="$PGID" --umask="$UMASK"
     --vfs-cache-mode=full --vfs-cache-max-size="$RCLONE_CACHE_SIZE"
     --vfs-cache-max-age="$RCLONE_CACHE_MAX_AGE" --buffer-size=0
