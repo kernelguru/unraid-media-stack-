@@ -20,7 +20,7 @@
 #  "mediastack.conf" neben das Script legen (wird automatisch geladen).
 # =============================================================================
 set -Eeuo pipefail
-SCRIPT_VERSION="1.7.1"
+SCRIPT_VERSION="1.7.2"
 REPO_RAW="https://raw.githubusercontent.com/kernelguru/unraid-media-stack-/main"
 
 # ------------------------------- KONFIGURATION -------------------------------
@@ -334,11 +334,23 @@ write_plugin_remote() {
 
 host_mounted() { awk -v m="$MOUNT_HOST" '$2==m && $3 ~ /^fuse/' /proc/mounts | grep -q .; }
 host_healthy() { host_mounted && timeout 15 ls -A "$MOUNT_HOST" 2>/dev/null | grep -q completed-symlinks; }
+# Erst alle rclone-Prozesse für diesen Mount beenden und WARTEN, bis sie weg
+# sind: rclone hängt beim Beenden "seinen" Mount per Pfad aus. Läuft dann schon
+# ein neuer Mount am selben Pfad, würde sonst der neue ausgehängt.
+# Danach alle (ggf. gestapelten) FUSE-Mounts am Pfad entfernen.
 host_unmount() {
-  host_mounted || return 0
-  fusermount -uz "$MOUNT_HOST" 2>/dev/null || fusermount3 -uz "$MOUNT_HOST" 2>/dev/null || umount -l "$MOUNT_HOST" 2>/dev/null || true
-  pkill -f "rcloneorig .*mount $RCLONE_REMOTE: $MOUNT_HOST" 2>/dev/null || true
-  sleep 1
+  local pat="rcloneorig .*mount $RCLONE_REMOTE: $MOUNT_HOST" i
+  if pgrep -f "$pat" >/dev/null 2>&1; then
+    pkill -TERM -f "$pat" 2>/dev/null || true
+    for i in $(seq 1 30); do pgrep -f "$pat" >/dev/null 2>&1 || break; sleep 1; done
+    if pgrep -f "$pat" >/dev/null 2>&1; then pkill -KILL -f "$pat" 2>/dev/null || true; sleep 1; fi
+  fi
+  for i in 1 2 3 4 5; do
+    host_mounted || break
+    fusermount -uz "$MOUNT_HOST" 2>/dev/null || fusermount3 -uz "$MOUNT_HOST" 2>/dev/null \
+      || umount -l "$MOUNT_HOST" 2>/dev/null || true
+    sleep 1
+  done
 }
 
 # Mount mit dem Plugin-rclone als Daemon direkt auf dem Host
