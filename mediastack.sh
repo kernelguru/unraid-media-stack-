@@ -20,7 +20,7 @@
 #  "mediastack.conf" neben das Script legen (wird automatisch geladen).
 # =============================================================================
 set -Eeuo pipefail
-SCRIPT_VERSION="1.7.2"
+SCRIPT_VERSION="1.8.0"
 REPO_RAW="https://raw.githubusercontent.com/kernelguru/unraid-media-stack-/main"
 
 # ------------------------------- KONFIGURATION -------------------------------
@@ -302,8 +302,6 @@ EOF
   chmod 600 "$dir/rclone.conf"
 }
 
-# Unraid: /etc/cron.d liegt im RAM. Dauerhaft sind nur *.cron-Dateien unter
-# /boot/config/plugins/<name>/, die update_cron nach /etc/cron.d/root übernimmt.
 # ---- rclone über das Unraid-Plugin ------------------------------------------
 # Das Plugin installiert das echte Binary als /usr/sbin/rcloneorig und einen
 # Wrapper /usr/sbin/rclone, der immer --config $RCLONE_PLG_CONF setzt.
@@ -372,8 +370,87 @@ host_mount() {
   return 1
 }
 
-CRON_FILE=/boot/config/plugins/mediastack/mediastack.cron
+# ---- Neustartfest: Hooks + go-Eintrag ----------------------------------------
+# 1. disks_mounted (nach dem Einhängen der Platten, VOR Docker): Mountpunkt
+#    als shared-Bind-Mount vorbereiten.
+# 2. started (Array + Docker laufen): Watchdog im Boot-Modus starten.
+# 3. Zusätzlich startet die go-Datei einen Boot-Wächter im Hintergrund, der
+#    wartet, bis das Array (und damit das Script) da ist – falls der started-
+#    Hook nicht greift. Doppelte Läufe verhindert das Lock im Watchdog.
+# Die Event-Verzeichnisse liegen im RAM; die go-Datei legt sie bei jedem Boot an.
+HOOK_DIR=/boot/config/plugins/mediastack
+HOOK_SRC=$HOOK_DIR/mount-prep.sh
+HOOK_DST=/usr/local/emhttp/plugins/mediastack/event/disks_mounted
+HOOK2_SRC=$HOOK_DIR/started.sh
+HOOK2_DST=/usr/local/emhttp/plugins/mediastack/event/started
+BOOT_SRC=$HOOK_DIR/boot-watch.sh
+install_boot_hooks() {
+  mkdir -p "$HOOK_DIR"
+  cat > "$HOOK_SRC" <<EOF
+#!/bin/bash
+# mediastack: Mountpunkt für rclone "shared" machen
+M="$MOUNT_HOST"
+mkdir -p "\$M"
+mountpoint -q "\$M" || mount --bind "\$M" "\$M"
+mount --make-shared "\$M"
+logger -t mediastack "Mountpunkt \$M vorbereitet (shared)"
+EOF
+  install -D -m 755 "$HOOK_SRC" "$HOOK_DST"
+
+  cat > "$HOOK2_SRC" <<EOF
+#!/bin/bash
+# mediastack: rclone-Mount nach dem Array-Start einhängen
+logger -t mediastack "Event started: starte Watchdog (boot)"
+setsid nohup bash "$SELF" watchdog boot >/dev/null 2>&1 < /dev/null &
+EOF
+  install -D -m 755 "$HOOK2_SRC" "$HOOK2_DST"
+
+  cat > "$BOOT_SRC" <<EOF
+#!/bin/bash
+# mediastack: Boot-Wächter – wartet bis zu 60 Min. auf Array + Docker,
+# dann Watchdog im Boot-Modus (falls der started-Hook nicht gegriffen hat)
+for i in \$(seq 1 360); do
+  [ -f "$SELF" ] && docker info >/dev/null 2>&1 && break
+  sleep 10
+done
+[ -f "$SELF" ] || { logger -t mediastack "Boot-Wächter: Script nicht gefunden ($SELF)"; exit 0; }
+logger -t mediastack "Boot-Wächter: Array/Docker bereit, starte Watchdog (boot)"
+exec bash "$SELF" watchdog boot
+EOF
+
+  local go=/boot/config/go
+  if [[ -f $go ]] && ! grep -q '# >>> mediastack v5' "$go"; then
+    log "Aktualisiere Boot-Eintrag in $go"
+    sed -i '/# >>> mediastack/,/# <<< mediastack/d' "$go"
+    cat >> "$go" <<EOF
+
+# >>> mediastack v5 (rclone-Mount: Hooks, Boot-Wächter, Watchdog-Cron)
+install -D -m 755 $HOOK_SRC $HOOK_DST
+install -D -m 755 $HOOK2_SRC $HOOK2_DST
+bash $HOOK_SRC
+setsid nohup bash $BOOT_SRC >/dev/null 2>&1 < /dev/null &
+/usr/local/sbin/update_cron
+# <<< mediastack
+EOF
+  fi
+}
+
+# Status der Neustart-Absicherung (für doctor)
+boot_status_ok() {
+  [[ -x $HOOK_DST && -x $HOOK2_DST && -f $BOOT_SRC ]] || return 1
+  grep -q '# >>> mediastack v5' /boot/config/go 2>/dev/null || return 1
+  if [[ $WATCHDOG_ENABLED == true ]]; then grep -qF "$(basename "$SELF") watchdog" /etc/cron.d/root 2>/dev/null || return 1; fi
+  return 0
+}
+
+# Unraid: /etc/cron.d liegt im RAM. update_cron baut /etc/cron.d/root bei jedem
+# Boot neu – aber nur aus *.cron-Dateien von INSTALLIERTEN Plugins. "mediastack"
+# ist kein Plugin, deshalb liegt die Datei im dynamix-Ordner (Unraid selbst),
+# der immer eingelesen wird.
+CRON_FILE=/boot/config/plugins/dynamix/mediastack.cron
+CRON_OLD=/boot/config/plugins/mediastack/mediastack.cron
 install_watchdog() {
+  rm -f "$CRON_OLD"
   mkdir -p "$(dirname "$CRON_FILE")"
   if [[ $WATCHDOG_ENABLED == true ]]; then
     {
@@ -532,6 +609,16 @@ run_doctor() {
   for round in 1 2 3 4 5; do
     (( DOC_QUIET )) || echo "${c_b}── rclone-Mount: Prüfung $round ──${c_0}"
     if check_chain; then
+      if (( ! DOC_QUIET )); then
+        if boot_status_ok; then ok "Neustart-Absicherung (Hooks, go-Eintrag, Watchdog-Cron)"
+        else
+          bad "Neustart-Absicherung unvollständig (Hooks/go-Eintrag/Watchdog-Cron)"
+          if ask "Hooks, go-Eintrag und Watchdog-Cron neu einrichten"; then
+            install_boot_hooks; install_watchdog
+            boot_status_ok && ok "Neustart-Absicherung eingerichtet" || bad "Weiterhin unvollständig – grep mediastack /etc/cron.d/root /boot/config/go"
+          fi
+        fi
+      fi
       if (( DOC_QUIET )); then
         (( round > 1 )) && logger -t mediastack "rclone-Mount repariert"
       else
@@ -572,11 +659,14 @@ case "$CMD" in
     esac
     trap - ERR; set +e
     [[ -f $STATE_DIR/watchdog.paused ]] && exit 0
-    if [[ ${1:-} == boot ]]; then                  # nach dem Array-Start: bis zu 10 Min. auf InfiniDysk warten
+    if [[ ${1:-} == boot ]]; then                  # nach dem Array-Start: bis zu 15 Min. auf InfiniDysk warten
       detect_ip
-      for i in $(seq 1 120); do
+      logger -t mediastack "Boot: warte auf InfiniDysk ($SERVER_IP:$P_INFINIDYSK)"
+      for i in $(seq 1 180); do
         curl -s -o /dev/null -m 5 "http://$SERVER_IP:$P_INFINIDYSK/" && break; sleep 5
       done
+      sleep 10                                     # InfiniDysk-Backend etwas Zeit geben
+      logger -t mediastack "Boot: prüfe/hänge rclone-Mount ein"
     fi
     docker info >/dev/null 2>&1 || exit 0          # Array/Docker gestoppt
     exists infinidysk || exit 0
@@ -585,7 +675,7 @@ case "$CMD" in
     DOC_AUTO=1; DOC_QUIET=1
     run_doctor; exit $? ;;
   remove)
-    rm -f "$CRON_FILE"; /usr/local/sbin/update_cron >/dev/null 2>&1 || true
+    rm -f "$CRON_FILE" "$CRON_OLD"; /usr/local/sbin/update_cron >/dev/null 2>&1 || true
     [[ $RCLONE_MODE == plugin ]] && host_unmount && log "rclone-Mount $MOUNT_HOST ausgehängt (Plugin bleibt installiert)"
     for c in "${CONTAINERS[@]}"; do exists "$c" && remove_ct "$c" && log "$c entfernt"; done
     log "Configs in $APPDATA und Medien in $DATA wurden NICHT gelöscht."; exit 0 ;;
@@ -656,50 +746,7 @@ chown -R 1000:1000 "$APPDATA/seerr"     # Seerr läuft als UID 1000
 # Damit der rclone-Mount aus dem Container auf dem Host und in den anderen
 # Containern sichtbar wird, muss der Mountpunkt "shared" sein.
 prep_mount
-# Neustartfest: Unraid führt Event-Skripte unter
-# /usr/local/emhttp/plugins/<name>/event/disks_mounted nach dem Einhängen der
-# Platten und VOR dem Start von Docker aus. Die go-Datei installiert den Hook
-# bei jedem Boot neu (das Verzeichnis liegt im RAM).
-HOOK_DIR=/boot/config/plugins/mediastack
-HOOK_SRC=$HOOK_DIR/mount-prep.sh
-HOOK_DST=/usr/local/emhttp/plugins/mediastack/event/disks_mounted
-mkdir -p "$HOOK_DIR"
-cat > "$HOOK_SRC" <<EOF
-#!/bin/bash
-# mediastack: Mountpunkt für den rclone-Container "shared" machen
-M="$MOUNT_HOST"
-mkdir -p "\$M"
-mountpoint -q "\$M" || mount --bind "\$M" "\$M"
-mount --make-shared "\$M"
-logger -t mediastack "Mountpunkt \$M vorbereitet (shared)"
-EOF
-install -D -m 755 "$HOOK_SRC" "$HOOK_DST"
-
-# Hook "started": läuft, wenn Array und Docker oben sind. Startet den Watchdog
-# im Hintergrund; der wartet auf InfiniDysk und hängt dann den Mount ein.
-HOOK2_SRC=$HOOK_DIR/started.sh
-HOOK2_DST=/usr/local/emhttp/plugins/mediastack/event/started
-cat > "$HOOK2_SRC" <<EOF
-#!/bin/bash
-# mediastack: rclone-Mount nach dem Array-Start einhängen
-nohup bash "$SELF" watchdog boot >/dev/null 2>&1 &
-EOF
-install -D -m 755 "$HOOK2_SRC" "$HOOK2_DST"
-
-GO=/boot/config/go
-if [[ -f $GO ]] && ! grep -q '# >>> mediastack v4' "$GO"; then
-  log "Aktualisiere Boot-Eintrag in $GO"
-  sed -i '/# >>> mediastack/,/# <<< mediastack/d' "$GO"
-  cat >> "$GO" <<EOF
-
-# >>> mediastack v4 (rclone-Mount: Hooks + Watchdog-Cron)
-install -D -m 755 $HOOK_SRC $HOOK_DST
-install -D -m 755 $HOOK2_SRC $HOOK2_DST
-bash $HOOK_SRC
-/usr/local/sbin/update_cron
-# <<< mediastack
-EOF
-fi
+install_boot_hooks
 
 # ------------------------------- 3. *arr API-Keys vorbelegen -----------------
 seed_arr() {  # name port -> setzt Variable KEY_<NAME>

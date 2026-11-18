@@ -165,7 +165,14 @@ grep mediastack /var/log/syslog
 - Läuft Docker nicht (Array gestoppt), tut er nichts. Zwei Läufe gleichzeitig verhindert ein Lock.
 - Für Wartungsarbeiten: `bash mediastack.sh watchdog pause`, danach `bash mediastack.sh watchdog resume`.
 
-**Cron unter Unraid:** `/etc/cron.d` liegt im RAM und ist nach jedem Neustart leer. Der Job steht deshalb in `/boot/config/plugins/mediastack/mediastack.cron`. Unraids `update_cron` übernimmt ihn nach `/etc/cron.d/root`, ausgelöst vom Script und beim Booten von der go-Datei. Abschalten: `WATCHDOG_ENABLED=false` in `mediastack.conf`, dann `bash mediastack.sh update`.
+**Cron unter Unraid:** `/etc/cron.d` liegt im RAM. `update_cron` baut die Datei bei jedem Boot neu, und zwar nur aus `*.cron`-Dateien von *installierten* Plugins. `mediastack` ist kein Plugin, deshalb liegt der Job in `/boot/config/plugins/dynamix/mediastack.cron`. Den Ordner von Unraid selbst liest `update_cron` immer ein. Prüfen: `grep mediastack /etc/cron.d/root`. Abschalten: `WATCHDOG_ENABLED=false` in `mediastack.conf`, dann `bash mediastack.sh update`.
+
+**Nach einem Neustart** sorgen drei Stufen dafür, dass der Mount wieder da ist:
+1. **Hook `disks_mounted`** (vor Docker): Er macht den Mountpunkt *shared*.
+2. **Hook `started`** (Array und Docker laufen) und zusätzlich ein **Boot-Wächter aus der go-Datei**: Beide starten den Watchdog im Boot-Modus. Der wartet bis zu 15 Minuten auf InfiniDysk und hängt dann ein. Ein Lock verhindert, dass beide gleichzeitig laufen.
+3. **Watchdog-Cron** alle 5 Minuten als Rückfallebene.
+
+Was beim Booten passiert ist: `grep mediastack /var/log/syslog`. `doctor` prüft am Ende auch, ob Hooks, go-Eintrag und Cron vollständig sind, und richtet sie bei Bedarf neu ein.
 
 ## TRaSH-Guides (deutsche Profile)
 
@@ -259,7 +266,7 @@ bash mediastack.sh recreate rclone-nzbdav prowlarr radarr sonarr jellyfin seerr
 - **Mount-Propagation (Unraid-spezifisch):** Damit der Mount in Radarr, Sonarr und Jellyfin ankommt, muss `/mnt/addons/nzbdav` ein *shared*-Mountpunkt sein, und zwar **bevor** Docker startet. Unraid hat kein systemd, das das von sich aus erledigt. Deshalb:
   - legt das Script einen Unraid-Event-Hook an (`disks_mounted`, läuft nach dem Einhängen der Platten und vor Docker), Quelle: `/boot/config/plugins/mediastack/mount-prep.sh`
   - legt einen zweiten Hook an (`started`, läuft nach dem Start von Array und Docker), der den rclone-Mount einhängt, sobald InfiniDysk antwortet
-  - ergänzt einen markierten Block in `/boot/config/go` (`# >>> mediastack v4`), der beide Hooks bei jedem Boot installiert und den Watchdog-Cron lädt
+  - ergänzt einen markierten Block in `/boot/config/go` (`# >>> mediastack v5`), der die Hooks bei jedem Boot installiert, den Boot-Wächter startet und den Watchdog-Cron lädt
   - prüft das Script bei jedem Lauf, ob der Mountpunkt *shared* ist. Wenn nicht, repariert es ihn und startet rclone, Radarr, Sonarr und Jellyfin neu.
 
   Zum Deinstallieren den Block aus der go-Datei und den Ordner `/boot/config/plugins/mediastack` entfernen.
