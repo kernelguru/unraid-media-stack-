@@ -44,7 +44,9 @@
 #RECYCLARR_ENABLED=true
 # german-hd-bluray-web | german-hd-remux-web | german-uhd-bluray-web |
 # german-uhd-bluray-web-alternative | german-uhd-remux-web | german-anime-hd-bluray-web
-#TRASH_PROFILE="german-hd-bluray-web"
+#TRASH_PROFILES=(german-hd-bluray-web german-uhd-bluray-web)   # erstes = Haupt-Profil
+#TRASH_ANY_GERMAN=true          # eigenes Profil "[German] Any" (nur deutsch, Upgrades bis 1080p)
+#SEERR_PROFILE="[German] HD Bluray + WEB"
 #RECYCLARR_SCHEDULE="@daily"
 #SEERR_USE_TRASH_PROFILE=true
 

@@ -20,7 +20,7 @@
 #  "mediastack.conf" neben das Script legen (wird automatisch geladen).
 # =============================================================================
 set -Eeuo pipefail
-SCRIPT_VERSION="1.8.0"
+SCRIPT_VERSION="1.9.0"
 REPO_RAW="https://raw.githubusercontent.com/kernelguru/unraid-media-stack-/main"
 
 # ------------------------------- KONFIGURATION -------------------------------
@@ -82,12 +82,18 @@ P_SONARR=8989;     P_JELLYFIN=8096; P_SEERR=5055
 
 # TRaSH-Guides per Recyclarr (Qualitätsprofile + Custom Formats)
 RECYCLARR_ENABLED=true
-# Deutsche Profile: german-hd-bluray-web, german-hd-remux-web,
-#   german-uhd-bluray-web, german-uhd-bluray-web-alternative,
-#   german-uhd-remux-web, german-anime-hd-bluray-web
-TRASH_PROFILE="german-hd-bluray-web"
+# TRaSH-Profile (beliebig viele, das erste ist das Haupt-Profil):
+#   german-hd-bluray-web, german-hd-remux-web, german-uhd-bluray-web,
+#   german-uhd-bluray-web-alternative, german-uhd-remux-web,
+#   german-anime-hd-bluray-web
+TRASH_PROFILES=()                    # leer = (german-hd-bluray-web german-uhd-bluray-web)
+TRASH_PROFILE=""                     # alt (v1.2–1.8), wird noch ausgewertet
+# Eigenes Profil "[German] Any": jede Qualität, aber nur mit deutscher Tonspur,
+# Upgrades bis 1080p (Custom Formats/Scores wie [German] HD Bluray + WEB)
+TRASH_ANY_GERMAN=true
 RECYCLARR_SCHEDULE="@daily"          # automatischer Abgleich (Cron-Syntax)
-SEERR_USE_TRASH_PROFILE=true         # Seerr fordert mit dem TRaSH-Profil an
+SEERR_USE_TRASH_PROFILE=true         # Seerr fordert mit SEERR_PROFILE an
+SEERR_PROFILE="[German] HD Bluray + WEB"
 
 # Watchdog: prüft den rclone-Mount alle 5 Minuten und repariert ihn still
 # (Meldungen im Unraid-Syslog unter "mediastack")
@@ -112,6 +118,11 @@ INDEXERS=(
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 [[ -f "$SCRIPT_DIR/mediastack.conf" ]] && source "$SCRIPT_DIR/mediastack.conf"
+# Abwärtskompatibel: einzelnes TRASH_PROFILE aus älteren Konfigurationen
+if (( ${#TRASH_PROFILES[@]} == 0 )); then
+  if [[ -n $TRASH_PROFILE ]]; then TRASH_PROFILES=("$TRASH_PROFILE")
+  else TRASH_PROFILES=(german-hd-bluray-web german-uhd-bluray-web); fi
+fi
 
 STATE_DIR="$APPDATA/mediastack"
 SECRETS="$STATE_DIR/secrets.env"
@@ -992,26 +1003,149 @@ for entry in "${INDEXERS[@]}"; do
 done
 
 # ------------------------------- 7b. TRaSH-Guides (Recyclarr) ---------------
-# Bevorzugt ein "[German] ..."-Profil, sonst das erste vorhandene
+# Bevorzugt SEERR_PROFILE, dann ein "[German] HD"-Profil, dann irgendein
+# "[German]"-Profil, sonst das erste vorhandene
 pick_profile() {  # key base-url -> {"id":..,"name":..}
-  arr "$1" GET "$2/api/v3/qualityprofile" | jq -c '([.[] | select(.name|startswith("[German]"))] + .)[0] | {id,name}'
+  arr "$1" GET "$2/api/v3/qualityprofile" | jq -c --arg p "$SEERR_PROFILE" '
+    ([.[] | select(.name==$p)] + [.[] | select(.name|startswith("[German] HD"))]
+     + [.[] | select(.name|startswith("[German]"))] + .)[0] | {id,name}'
+}
+
+# ---- Recyclarr-Konfiguration erzeugen ----------------------------------------
+# Profil- und Gruppen-IDs kommen aus den offiziellen recyclarr/config-templates.
+# "[German] Any" ist ein eigenes Profil mit den Custom Formats des TRaSH-Profils
+# "[German] HD Bluray + WEB" (Score-Set "german") plus den Standard-Formaten der
+# Gruppe "[Unwanted] Unwanted Formats German". Quelle: TRaSH-Guides JSON.
+ANY_CF_RADARR=(
+  3bc8df3a71baaac60a31ef696ea72d36 820b09bb9acbfde9c35c71e0e565dad8 b2be17d608fc88818940cd1833b0b24c
+  86bc3115eb4e9873ac96904a4a68e19e f845be10da4f442654c13e1f2c3d6cd5 6aad77771dabe9d3e9d7be86f310b867
+  4eadb75fb23d09dfc0a8e3f687e72287 54795711b78ea87e56127928c423689b 1bfc773c53283d47c68e535811da30b7
+  aee01d40cd1bf4bcded81ee62f0f3659 a2ab25194f463f057a5559c03c84a3df 08d120d5a003ec4954b5b255c0691d79
+  439f9d71becaed589058ec949e037ff3 2d136d4e33082fe573d06b1f237c40dd ed27ebfef2f323e964fb1f61391bcb35
+  c20c8647f2746a1f4c4262b0fbbeeeae 5608c71bcebba0a5e666223bae8c9227 c20f169ef63c5f40c2def54abaf4438e
+  403816d65392c79236dcb6dd591aeda4 af94e0fe497124d1f9ce732069ec8c3b e7718d7a3ce595f289bfee26adc178f5
+  ae43b294509409a6a13919dedd4764c4 5caaaa1c08c1742aa4342d8c4cc463f2
+  # Unwanted (German)
+  b8cd450cbfa689c0259a01d9e29ba3d6 cae4ca30163749b891686f95532519bd cc444569854e9de0b084ab2b8b1532b2
+  ed38b889b31be83fda192888e2286d83 0a3f082873eb454bde444150b70253cc 263943bc5d99550c68aad0c4278ba1c7
+  a826ee9e46607bc61795c85a6f2b1279 03c430f326f10a27a9739b8bc83c30e4 c465ccc73923871b3eb1802042331306
+  90a6f9a284dff5103f6346090e6280c8 e204b80c87be9497a8a6eaff48f72905 712d74cd88bceb883ee32f773656b1f5
+  bfd8eb01832d646a0a89c4deb46f8564
+)
+ANY_CF_SONARR=(
+  9aa0ca0d2d66b6f6ee51fc630f46cf6f 290078c8b266272a5cc8e251b5e2eb0b c99279ee27a154c2f20d1d505cc99e25
+  8a9fcdbb445f2add0505926df3bb7b8a ed51973a811f51985f14e2f6f290e47a c5dd0fd675f85487ad5bdf97159180bd
+  133589380b89f8f8394320901529bac1 7940b2fb0278f27cf4f70187f2be95d6 83b336a90d90d6b35ca673b007f80661
+  d8f8e1539827967e0e564833e6c08d33 68be37323132b35cf333c81a2ac8fc16 f51b96a50b0e6196cb69724b7833d837
+  bda67c2c0aae257308a4723d92475b86 c2eec878fa1989599c226ce4c287d6a7 d6819cba26b1a6508138d25fb5e32293
+  c2216b7b8aa545dc1ce8388c618f8d57 e6258996055b9fbab7e9cb2f75819294 58790d4e2fdcd9733aa7ae68ba2bb503
+  d84935abd3f8556dcd51d4f27e22d0a6 ec8fa7296b64e8cd390a1600981f3923 eb3d5cc0a2be0db205fb823640db6a3c
+  44e7c4de10ae50265753082e5dc76047
+  # Unwanted (German)
+  15a05bc7c1a36e2b57fd628f8977e2fc 85c61753df5da1fb2aab6f2a47426b09 fbcb31d8dabd2a319072b84fc0b7249c
+  a6a6c33d057406aaad978a6902823c35 d80c9f7cd2aad50271f1bd4e53125778 237eda4ef550a97da2c9d87b437e500b
+  9c11cd3f07101cdba90a2d81cf0e56b4 e2315f990da2e2cbfc9fa5b7a6fcfe48 23297a736ca77c0fc8e70f8edd7ee56c
+)
+# Deutsche Tonspur erzwingen: "German" (+10000) bzw. "German DL" (+11000);
+# rein englische Releases erreichen höchstens ~2500 Punkte.
+ANY_MIN_SCORE=5000
+ANY_UNTIL_SCORE=35000                # wie cutoffFormatScore der TRaSH-HD-Profile
+
+# Fingerabdruck der gewünschten Konfiguration (Profile + Any + Version des Aufbaus)
+recyclarr_sig() { printf '%s ' v1 "${TRASH_PROFILES[@]}" "$TRASH_ANY_GERMAN" "$ANY_MIN_SCORE" | md5sum | cut -c1-12; }
+
+# write_recyclarr_yml APP URL KEY DATEI
+write_recyclarr_yml() {
+  local app=$1 url=$2 key=$3 out=$4 prof tmp pid groups=() profiles=() g qdef ids
+  [[ $app == radarr ]] && qdef=movie || qdef=series
+  tmp=$(mktemp -d)
+  for prof in "${TRASH_PROFILES[@]}"; do
+    if ! curl -fsSL "$TEMPLATES_RAW/$app/templates/$prof.yml" -o "$tmp/$prof.yml"; then
+      warn "  Vorlage '$prof' für $app nicht gefunden – TRASH_PROFILES prüfen"; continue
+    fi
+    # Profil-ID: erster Eintrag unter quality_profiles
+    pid=$(awk '/^    quality_profiles:/{f=1;next} f && /^      - trash_id:/{print $3; exit}' "$tmp/$prof.yml")
+    [[ -n $pid ]] && profiles+=("$pid|$(sed -n "s/^      - trash_id: $pid *# *//p" "$tmp/$prof.yml" | head -1)")
+    # Standardmäßig aktive Gruppen (nicht auskommentiert) unter custom_format_groups.add
+    while read -r g; do
+      [[ -n $g && " ${groups[*]} " != *" $g|"* ]] && groups+=("$g|$(grep -m1 -o "trash_id: $g *#.*" "$tmp/$prof.yml" | sed 's/.*# *//')")
+    done < <(awk '/^      add:/{f=1;next} f && /^      [a-z]/{f=0} f && /^        - trash_id:/{print $3}' "$tmp/$prof.yml")
+  done
+  rm -rf "$tmp"
+  (( ${#profiles[@]} )) || return 1
+
+  {
+    echo "# mediastack-generated: $(recyclarr_sig)"
+    echo "# Erzeugt von mediastack.sh. Wird neu erzeugt (mit .bak), wenn sich"
+    echo "# TRASH_PROFILES/TRASH_ANY_GERMAN ändern. Eigene Anpassungen sonst erhalten."
+    echo "# yaml-language-server: \$schema=https://schemas.recyclarr.dev/v8/config-schema.json"
+    echo "$app:"
+    echo "  $app-mediastack:"
+    echo "    base_url: $url"
+    echo "    api_key: $key"
+    echo "    quality_definition:"
+    echo "      type: $qdef"
+    echo "    quality_profiles:"
+    local e
+    for e in "${profiles[@]}"; do
+      echo "      - trash_id: ${e%%|*}  # ${e#*|}"
+      echo "        reset_unmatched_scores:"
+      echo "          enabled: true"
+    done
+    if [[ $TRASH_ANY_GERMAN == true ]]; then
+      cat <<EOF
+      - name: "[German] Any"
+        score_set: german
+        reset_unmatched_scores:
+          enabled: true
+        min_format_score: $ANY_MIN_SCORE
+        upgrade:
+          allowed: true
+          until_quality: 1080p
+          until_score: $ANY_UNTIL_SCORE
+        quality_sort: top
+        qualities:
+          - name: 1080p
+            qualities: [Bluray-1080p, WEBDL-1080p, WEBRip-1080p, HDTV-1080p]
+          - name: 720p
+            qualities: [Bluray-720p, WEBDL-720p, WEBRip-720p, HDTV-720p]
+          - name: SD
+            qualities: [Bluray-576p, Bluray-480p, WEBDL-480p, WEBRip-480p, DVD, SDTV]
+EOF
+    fi
+    if (( ${#groups[@]} )); then
+      echo "    custom_format_groups:"
+      echo "      add:"
+      for e in "${groups[@]}"; do echo "        - trash_id: ${e%%|*}  # ${e#*|}"; done
+    fi
+    if [[ $TRASH_ANY_GERMAN == true ]]; then
+      [[ $app == radarr ]] && ids=("${ANY_CF_RADARR[@]}") || ids=("${ANY_CF_SONARR[@]}")
+      echo "    custom_formats:"
+      echo "      - trash_ids:"
+      for e in "${ids[@]}"; do echo "          - $e"; done
+      echo "        assign_scores_to:"
+      echo '          - name: "[German] Any"'
+    fi
+  } > "$out"
 }
 
 if [[ $RECYCLARR_ENABLED == true ]]; then
-  log "TRaSH-Guides über Recyclarr: $TRASH_PROFILE"
+  log "TRaSH-Guides über Recyclarr: ${TRASH_PROFILES[*]}$([[ $TRASH_ANY_GERMAN == true ]] && echo ' + [German] Any')"
   RC="$APPDATA/recyclarr"
   mkdir -p "$RC/configs"
+  sig=$(recyclarr_sig)
   for app in radarr sonarr; do
     f="$RC/configs/$app.yml"
-    if [[ -f $f ]]; then log "  $app.yml existiert – deine Anpassungen bleiben"; continue; fi
-    if [[ $app == radarr ]]; then u=$RA; k=$KEY_RADARR; else u=$SO; k=$KEY_SONARR; fi
-    if ! curl -fsSL "$TEMPLATES_RAW/$app/templates/$TRASH_PROFILE.yml" -o "$f.tmp"; then
-      rm -f "$f.tmp"; warn "  Vorlage '$TRASH_PROFILE' für $app nicht gefunden – TRASH_PROFILE prüfen"; continue
+    if [[ -f $f ]] && grep -q "^# mediastack-generated: $sig" "$f"; then
+      log "  $app.yml aktuell – deine Anpassungen bleiben"; continue
     fi
-    sed -e "0,/base_url:/s|^\([[:space:]]*base_url:\).*|\1 $u|" \
-        -e "0,/api_key:/s|^\([[:space:]]*api_key:\).*|\1 $k|" "$f.tmp" > "$f"
-    rm -f "$f.tmp"
-    log "  $app.yml aus Vorlage erstellt"
+    if [[ $app == radarr ]]; then u=$RA; k=$KEY_RADARR; else u=$SO; k=$KEY_SONARR; fi
+    [[ -f $f ]] && cp -p "$f" "$f.bak" && log "  alte $app.yml gesichert als $app.yml.bak"
+    if write_recyclarr_yml "$app" "$u" "$k" "$f.new"; then
+      mv -f "$f.new" "$f"; log "  $app.yml erzeugt"
+    else
+      rm -f "$f.new"; warn "  $app.yml konnte nicht erzeugt werden – bisherige Datei bleibt"
+    fi
   done
   chown -R "$PUID:$PGID" "$RC"; chmod 600 "$RC"/configs/*.yml 2>/dev/null || true
 
