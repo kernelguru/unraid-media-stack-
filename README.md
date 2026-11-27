@@ -144,11 +144,33 @@ bash mediastack.sh update             # Images aktualisieren + geänderte Konfig
 bash mediastack.sh self-update        # neue Script-Version von GitHub holen, danach automatisch "update"
 bash mediastack.sh recreate jellyfin  # einzelne Container neu anlegen (mehrere möglich)
 bash mediastack.sh status             # Status der Container + Script-Version
+bash mediastack.sh mediaserver emby   # Mediaserver wechseln (jellyfin|emby)
 bash mediastack.sh doctor             # rclone-Mount prüfen, Reparatur mit Rückfrage
 bash mediastack.sh doctor --yes       # dasselbe ohne Rückfrage
 bash mediastack.sh watchdog pause     # Mount-Überwachung pausieren (resume = fortsetzen)
 bash mediastack.sh remove             # Container entfernen (Configs und Medien bleiben erhalten)
 ```
+
+## Mediaserver: Jellyfin oder Emby
+
+Bei der **Erstinstallation** fragt das Script, welcher Mediaserver installiert werden soll. Standard ist Jellyfin. Fest vorgeben lässt er sich mit `MEDIASERVER=jellyfin|emby` in der `mediastack.conf`.
+
+| | Jellyfin | Emby |
+|---|---|---|
+| Kosten | kostenlos | Grundfunktionen kostenlos |
+| Hardware-Transcoding | ja, wird automatisch eingerichtet | nur mit **Emby Premiere**. Die GPU wird durchgereicht, einschalten musst du es in Emby |
+| Bibliothek „Adult“ nur für Admins | automatisch | von Hand einrichten |
+
+Eingerichtet werden bei beiden: Admin-Konto, die Bibliotheken *Filme* und *Serien*, API-Key, die Benachrichtigung aus Radarr und Sonarr, Seerr und das Dashboard. Beide nutzen Port 8096. Es läuft immer nur einer.
+
+**Wechsel nach der Installation:**
+```bash
+bash mediastack.sh mediaserver emby       # bzw. jellyfin
+```
+1. Der bisherige Container wird entfernt. Seine Daten bleiben in `appdata/jellyfin` bzw. `appdata/emby`, ein Zurückwechseln findet also alles wieder.
+2. **Seerr wird neu eingerichtet**, denn Seerr kann nur einen Mediaserver. Bisherige Anfragen und Seerr-Benutzer gehen dabei verloren. Die alte Konfiguration bleibt als `appdata/seerr.bak-<Datum>` liegen.
+3. Radarr, Sonarr (Benachrichtigung) und das Dashboard werden auf den neuen Server umgestellt.
+4. Gesehen-Status und Wiedergabefortschritt werden **nicht** übertragen.
 
 ## Hardware-Beschleunigung (Jellyfin)
 

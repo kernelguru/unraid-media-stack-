@@ -13,6 +13,7 @@
 #    bash mediastack.sh recreate NAME.. -> einzelne Container neu anlegen
 #    bash mediastack.sh status          -> Container-Status anzeigen
 #    bash mediastack.sh doctor [--yes]  -> rclone-Mount prüfen + reparieren
+#    bash mediastack.sh mediaserver jellyfin|emby -> Mediaserver wechseln
 #    bash mediastack.sh watchdog pause|resume -> Mount-Überwachung pausieren
 #    bash mediastack.sh dashboard-status -> Status fürs Dashboard schreiben (läuft minütlich)
 #    bash mediastack.sh remove          -> Container entfernen (Daten bleiben!)
@@ -21,7 +22,7 @@
 #  "mediastack.conf" neben das Script legen (wird automatisch geladen).
 # =============================================================================
 set -Eeuo pipefail
-SCRIPT_VERSION="2.4.0"
+SCRIPT_VERSION="2.5.0"
 REPO_RAW="https://raw.githubusercontent.com/kernelguru/unraid-media-stack-/main"
 
 # ------------------------------- KONFIGURATION -------------------------------
@@ -48,7 +49,12 @@ MOUNT_CT="/mnt/nzbdav"               # derselbe Mount in allen Containern
 
 INSTALL_DOCKER=true                  # Debian/Ubuntu: Docker aus dem offiziellen Repo installieren
 
-# Hardware-Beschleunigung für Jellyfin:
+# Mediaserver: jellyfin | emby. Leer = bei der Erstinstallation fragen,
+# danach gilt die gespeicherte Wahl. Wechsel: bash mediastack.sh mediaserver emby
+# (Emby: Hardware-Transcoding nur mit Emby Premiere)
+MEDIASERVER=""
+
+# Hardware-Beschleunigung für den Mediaserver (Jellyfin):
 #   auto  = erkennen (NVIDIA mit Docker-Runtime → nvenc, Intel → qsv, AMD → vaapi)
 #   none | qsv | vaapi | nvenc
 JELLYFIN_HWACCEL="auto"
@@ -106,6 +112,7 @@ IMG_PROWLARR="lscr.io/linuxserver/prowlarr:latest"
 IMG_RADARR="lscr.io/linuxserver/radarr:latest"
 IMG_SONARR="lscr.io/linuxserver/sonarr:latest"
 IMG_JELLYFIN="lscr.io/linuxserver/jellyfin:latest"
+IMG_EMBY="lscr.io/linuxserver/emby:latest"
 IMG_SEERR="ghcr.io/seerr-team/seerr:latest"
 IMG_RECYCLARR="ghcr.io/recyclarr/recyclarr:8"    # "latest" wird nicht mehr gepflegt
 IMG_DASHBOARD="nginx:alpine"
@@ -190,9 +197,21 @@ host_mode() { [[ $RCLONE_MODE == plugin || $RCLONE_MODE == systemd ]]; }
 
 STATE_DIR="$APPDATA/mediastack"
 SECRETS="$STATE_DIR/secrets.env"
+# Mediaserver: mediastack.conf > gespeicherte Wahl > (Erstinstallation: Frage)
+MS_STATE="$STATE_DIR/mediaserver"
+MS_FROM_CONF=${MEDIASERVER:-}
+[[ -z $MEDIASERVER && -f $MS_STATE ]] && MEDIASERVER=$(<"$MS_STATE")
+set_mediaserver_vars() {
+  case ${MEDIASERVER:-jellyfin} in
+    emby) MS_CT=emby;     MS_LABEL=Emby;     MS_IMG=$IMG_EMBY;     MS_PING=/emby/System/Info/Public; MS_SEERR_TYPE=3 ;;
+    *)    MS_CT=jellyfin; MS_LABEL=Jellyfin; MS_IMG=$IMG_JELLYFIN; MS_PING=/health;                  MS_SEERR_TYPE=2 ;;
+  esac
+}
+set_mediaserver_vars
+
 # Versteckter Schalter: bash mediastack.sh whisparr on|off
 WHISPARR_ENABLED=false; [[ -f $STATE_DIR/.whisparr ]] && WHISPARR_ENABLED=true
-CONTAINERS=(dashboard seerr jellyfin recyclarr whisparr sonarr radarr prowlarr rclone-nzbdav infinidysk)
+CONTAINERS=(dashboard seerr jellyfin emby recyclarr whisparr sonarr radarr prowlarr rclone-nzbdav infinidysk)
 
 # ------------------------------- Hilfsfunktionen -----------------------------
 c_g=$'\e[32m'; c_y=$'\e[33m'; c_r=$'\e[31m'; c_b=$'\e[1m'; c_0=$'\e[0m'
@@ -365,7 +384,9 @@ write_default_conf() {
 # kommagetrennt; Server-IP und Hostname sind automatisch enthalten
 #ARR_ALLOWED_HOSTS="$ARR_ALLOWED_HOSTS"
 
-# ---- Jellyfin -----------------------------------------------------------------
+# ---- Mediaserver ---------------------------------------------------------------
+# Wechsel am besten mit: bash mediastack.sh mediaserver jellyfin|emby
+#MEDIASERVER="$MEDIASERVER"          # jellyfin | emby
 #LANG_CODE="$LANG_CODE"
 #COUNTRY_CODE="$COUNTRY_CODE"
 #JELLYFIN_HWACCEL="$JELLYFIN_HWACCEL" # auto | none | qsv | vaapi | nvenc
@@ -466,18 +487,21 @@ write_mount_status() {  # rc [detail]
 # status.json für das Dashboard – wird serverseitig erzeugt (minütlich per
 # Cron/Timer), damit die Seite auch über HTTPS/Reverse Proxy funktioniert.
 # Die Apps werden über 127.0.0.1 geprüft (in den Allowed Hosts enthalten).
-DASH_CHECKS=("Seerr|$P_SEERR|/api/v1/status" "Jellyfin|$P_JELLYFIN|/health" "Radarr|$P_RADARR|/ping"
-             "Sonarr|$P_SONARR|/ping" "Prowlarr|$P_PROWLARR|/ping" "InfiniDysk|$P_INFINIDYSK|/")
-[[ $WHISPARR_ENABLED == true ]] && DASH_CHECKS+=("Whisparr|$P_WHISPARR|/ping")
+dash_checks() {
+  printf '%s\n' "Seerr|$P_SEERR|/api/v1/status" "$MS_LABEL|$P_JELLYFIN|$MS_PING" "Radarr|$P_RADARR|/ping" \
+    "Sonarr|$P_SONARR|/ping" "Prowlarr|$P_PROWLARR|/ping" "InfiniDysk|$P_INFINIDYSK|/"
+  [[ $WHISPARR_ENABLED == true ]] && echo "Whisparr|$P_WHISPARR|/ping"
+  return 0
+}
 write_status_json() {
   [[ $DASHBOARD_ENABLED == true && -d $DASH_DIR ]] || return 0
   local e name port path code apps='{}' mok=false detail="" doc='{}'
-  for e in "${DASH_CHECKS[@]}"; do
+  while IFS= read -r e; do
     IFS='|' read -r name port path <<<"$e"
     code=$(curl -s -o /dev/null -m 5 -w '%{http_code}' "http://127.0.0.1:$port$path" 2>/dev/null || true)
     apps=$(jq -c --arg n "$name" --argjson up "$([[ $code =~ ^[2-4][0-9][0-9]$ ]] && echo true || echo false)" \
            '. + {($n): $up}' <<<"$apps")
-  done
+  done < <(dash_checks)
   if host_healthy 2>/dev/null; then mok=true
   else
     [[ -f $DASH_DIR/.doctor.json ]] && detail=$(jq -r 'select(.ok|not) | .detail // empty' "$DASH_DIR/.doctor.json" 2>/dev/null || true)
@@ -542,7 +566,7 @@ write_dashboard() {
   local seerr_key=""
   [[ -f $APPDATA/seerr/settings.json ]] && seerr_key=$(jq -r '.main.apiKey // empty' "$APPDATA/seerr/settings.json" 2>/dev/null || true)
   jq -n --arg ip "$SERVER_IP" --arg v "$SCRIPT_VERSION" --arg t "$(date '+%d.%m.%Y %H:%M')" \
-        --arg icon "$ICON" --arg plat "$PLATFORM" \
+        --arg icon "$ICON" --arg plat "$PLATFORM" --arg msn "$MS_LABEL" --arg msi "$MS_CT" --arg msp "$MS_PING" \
         --arg pse "$P_SEERR" --arg pjf "$P_JELLYFIN" --arg pra "$P_RADARR" \
         --arg pso "$P_SONARR" --arg ppr "$P_PROWLARR" --arg pnd "$P_INFINIDYSK" \
         --arg kse "$seerr_key" --arg kjf "${JF_KEY:-}" --arg kra "${KEY_RADARR:-}" \
@@ -550,7 +574,7 @@ write_dashboard() {
     def app(n; d; p; ping; ic; k): {name:n, desc:d, url:"http://\($ip):\(p)/", ping:"http://\($ip):\(p)\(ping)", icon:"\($icon)/\(ic).png", key:k};
     {generated:$t, version:$v, platform:$plat, apps:[
       app("Seerr";      "Filme & Serien anfragen";     $pse; "/api/v1/status"; "seerr";     $kse),
-      app("Jellyfin";   "Mediaserver";                 $pjf; "/health";        "jellyfin";  $kjf),
+      app($msn;         "Mediaserver";                 $pjf; $msp;             $msi;        $kjf),
       app("Radarr";     "Filme";                       $pra; "/ping";          "radarr";    $kra),
       app("Sonarr";     "Serien";                      $pso; "/ping";          "sonarr";    $kso),
       app("Prowlarr";   "Indexer";                     $ppr; "/ping";          "prowlarr";  $kpr),
@@ -1232,7 +1256,7 @@ check_chain() {
     FIX=fix_mount; FIX_DESC="Mount aufräumen, rclone + Radarr/Sonarr/Jellyfin neu starten"; return 1; fi
   ok "Mount auf dem Host ($MOUNT_HOST)"
 
-  for c in radarr sonarr jellyfin; do
+  for c in radarr sonarr "$MS_CT"; do
     exists "$c" && running "$c" || continue
     out=$(timeout 15 docker exec "$c" ls -A "$MOUNT_CT" 2>&1 || true)
     if has_content "$out"; then ok "Mount in $c"; else bad "Mount in $c leer"; broken+=("$c"); fi
@@ -1264,7 +1288,7 @@ fix_propagation() {
   docker start rclone-nzbdav >/dev/null || return 1
   wait_ct_mount || { dmsg "    rclone hat nicht gemountet – docker logs rclone-nzbdav"; return 1; }
   sleep 2
-  fix_restart_apps radarr sonarr jellyfin
+  fix_restart_apps radarr sonarr "$MS_CT"
 }
 # Plugin-Modus: Mount neu aufbauen, dann Apps neu starten
 fix_host_mount() {
@@ -1272,7 +1296,7 @@ fix_host_mount() {
   prep_mount
   host_mount || { dmsg "    rclone-Mount fehlgeschlagen – Log: $STATE_DIR/rclone.log"; return 1; }
   sleep 2
-  fix_restart_apps radarr sonarr jellyfin
+  fix_restart_apps radarr sonarr "$MS_CT"
 }
 fix_mount() { if host_mode; then fix_host_mount; else fix_propagation; fi; }
 write_conf() { if [[ $RCLONE_MODE == plugin ]]; then write_plugin_remote; else write_rclone_conf; fi; }
@@ -1368,7 +1392,7 @@ case "$CMD" in
     DOC_AUTO=1; DOC_QUIET=1
     run_doctor; rc=$?; write_mount_status "$rc" "$LAST_BAD"
     [[ $RECYCLARR_ENABLED == true && $TRASH_ANY_GERMAN == true ]] && radarr_fix_profile_language quiet
-    [[ $WHISPARR_ENABLED == true ]] && jf_restrict_adult "${JF_KEY:-}"
+    [[ $WHISPARR_ENABLED == true && $MS_CT == jellyfin ]] && jf_restrict_adult "${JF_KEY:-}"
     exit $rc ;;
   dashboard-status)
     trap - ERR; set +e
@@ -1406,15 +1430,36 @@ case "$CMD" in
       exists "$c" && remove_ct "$c" && log "$c entfernt – wird neu angelegt"
     done ;;
   install)  ;;
+  mediaserver)
+    [[ $EUID -eq 0 ]] || die "Bitte als root ausführen."
+    [[ ${1:-} == jellyfin || ${1:-} == emby ]] || die "Aufruf: bash $SELF_NAME mediaserver jellyfin|emby"
+    [[ -z $MS_FROM_CONF || $MS_FROM_CONF == "$1" ]] \
+      || die "In mediastack.conf steht MEDIASERVER=\"$MS_FROM_CONF\" – dort anpassen oder die Zeile auskommentieren."
+    old=${MEDIASERVER:-jellyfin}
+    if [[ $old == "$1" ]] && exists "$1"; then log "$MS_LABEL ist bereits der Mediaserver."; exit 0; fi
+    cat <<EOF
+${c_b}Wechsel: $old → $1${c_0}
+  • Container $old wird entfernt (Daten bleiben in $APPDATA/$old)
+  • Seerr wird NEU eingerichtet – bisherige Anfragen und Benutzer gehen verloren
+    (Sicherung: $APPDATA/seerr.bak-<Datum>)
+  • Radarr/Sonarr, Dashboard und Bibliotheken werden auf $1 umgestellt
+$([[ $1 == emby ]] && echo "  • Emby: Hardware-Transcoding nur mit Emby Premiere")
+EOF
+    read -rp "Fortfahren? [j/N] " a; [[ $a =~ ^[jJyY] ]] || exit 0
+    mkdir -p "$STATE_DIR"; echo "$1" > "$MS_STATE"
+    exists "$old" && remove_ct "$old" && log "$old entfernt"
+    if exists seerr; then remove_ct seerr; fi
+    if [[ -d $APPDATA/seerr ]]; then
+      mv "$APPDATA/seerr" "$APPDATA/seerr.bak-$(date +%Y%m%d-%H%M)" && log "Seerr-Konfiguration gesichert"
+    fi
+    MEDIASERVER=$1; set_mediaserver_vars ;;
   whisparr)
     [[ $EUID -eq 0 ]] || die "Bitte als root ausführen."
     case "${1:-}" in
       on)  mkdir -p "$STATE_DIR"; touch "$STATE_DIR/.whisparr"
-           [[ $WHISPARR_ENABLED == true ]] || DASH_CHECKS+=("Whisparr|$P_WHISPARR|/ping")
            WHISPARR_ENABLED=true
            log "Whisparr wird eingerichtet" ;;
       off) rm -f "$STATE_DIR/.whisparr"; WHISPARR_ENABLED=false
-           _dc=(); for e in "${DASH_CHECKS[@]}"; do [[ $e == Whisparr\|* ]] || _dc+=("$e"); done; DASH_CHECKS=("${_dc[@]}")
            exists whisparr && remove_ct whisparr && log "whisparr entfernt (Daten bleiben in $APPDATA/whisparr)" ;;
       *)   die "Aufruf: bash $SELF_NAME whisparr on|off" ;;
     esac ;;
@@ -1443,6 +1488,23 @@ log "Pfade: Configs $APPDATA · Medien $DATA/media · Mount $MOUNT_HOST · Benut
 [[ -n $SERVER_IP ]] || SERVER_IP=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')
 [[ -n $SERVER_IP ]] || die "Server-IP nicht erkannt – bitte SERVER_IP setzen."
 log "Server-IP: $SERVER_IP"
+# Mediaserver wählen (nur bei Erstinstallation ohne Vorgabe)
+if [[ -z $MEDIASERVER ]]; then
+  if exists emby && ! exists jellyfin; then MEDIASERVER=emby
+  elif exists jellyfin || [[ -f $SECRETS ]] || [[ ! -t 0 ]]; then MEDIASERVER=jellyfin
+  else
+    echo
+    echo "${c_b}Welcher Mediaserver?${c_0}"
+    echo "  1) Jellyfin  – kostenlos, inkl. Hardware-Transcoding (empfohlen)"
+    echo "  2) Emby      – Hardware-Transcoding nur mit Emby Premiere"
+    read -rp "Auswahl [1]: " a
+    [[ $a == 2 ]] && MEDIASERVER=emby || MEDIASERVER=jellyfin
+  fi
+fi
+[[ $MEDIASERVER == jellyfin || $MEDIASERVER == emby ]] || die "MEDIASERVER muss jellyfin oder emby sein."
+mkdir -p "$STATE_DIR"; echo "$MEDIASERVER" > "$MS_STATE"
+set_mediaserver_vars
+log "Mediaserver: $MS_LABEL"
 write_default_conf
 
 if (( PULL )); then
@@ -1469,9 +1531,9 @@ save_secret ADMIN_USER "$ADMIN_USER"; save_secret ADMIN_PASS "$ADMIN_PASS"
 # ------------------------------- 1. Ordner -----------------------------------
 log "Lege Ordner an"
 mkdir -p "$DATA/media/movies" "$DATA/media/tv" \
-         "$APPDATA"/{infinidysk,rclone-nzbdav/cache,prowlarr,radarr,sonarr,jellyfin,seerr}
+         "$APPDATA"/{infinidysk,rclone-nzbdav/cache,prowlarr,radarr,sonarr,seerr} "$APPDATA/$MS_CT"
 chown "$PUID:$PGID" "$DATA" "$DATA/media" "$DATA/media/movies" "$DATA/media/tv"
-chown -R "$PUID:$PGID" "$APPDATA"/{infinidysk,prowlarr,radarr,sonarr,jellyfin}
+chown -R "$PUID:$PGID" "$APPDATA"/{infinidysk,prowlarr,radarr,sonarr} "$APPDATA/$MS_CT"
 chown -R 1000:1000 "$APPDATA/seerr"     # Seerr läuft als UID 1000
 if [[ $WHISPARR_ENABLED == true ]]; then
   mkdir -p "$DATA/media/adult" "$APPDATA/whisparr"
@@ -1631,7 +1693,7 @@ fi   # RCLONE_MODE
 
 # Container, die vor der Korrektur liefen, sehen den Mount erst nach Neustart
 if (( MOUNT_FIXED )); then
-  for c in radarr sonarr jellyfin; do
+  for c in radarr sonarr "$MS_CT"; do
     exists "$c" && docker restart "$c" >/dev/null && log "$c neu gestartet (Mount)"
   done
 fi
@@ -1661,13 +1723,25 @@ if [[ $WHISPARR_ENABLED == true ]]; then
 fi
 
 detect_hwaccel
-log "Jellyfin Hardware-Beschleunigung: $JF_HW_TYPE${JF_HW_DEV:+ ($JF_HW_DEV)}"
-run_ct jellyfin $P_JELLYFIN "$ICON/jellyfin.png" -- \
+log "$MS_LABEL Hardware-Beschleunigung: $JF_HW_TYPE${JF_HW_DEV:+ ($JF_HW_DEV)}"
+# Emby: das OpenCL-Mod ist ein Jellyfin-Mod
+if [[ $MS_CT == emby ]]; then
+  _hw=(); for e in "${JF_HW_ARGS[@]}"; do [[ $e == DOCKER_MODS=* ]] && { unset '_hw[-1]'; continue; }; _hw+=("$e"); done
+  JF_HW_ARGS=("${_hw[@]}")
+fi
+# Nur ein Mediaserver: den anderen (vom Script angelegten) entfernen
+for _other in jellyfin emby; do
+  [[ $_other == "$MS_CT" ]] && continue
+  if exists "$_other" && [[ $(docker inspect -f '{{index .Config.Labels "mediastack.hash"}}' "$_other" 2>/dev/null) =~ ^[0-9a-f]{12}$ ]]; then
+    remove_ct "$_other" && log "$_other entfernt (Mediaserver ist jetzt $MS_LABEL)"
+  fi
+done
+run_ct "$MS_CT" $P_JELLYFIN "$ICON/$MS_CT.png" -- \
   "${LSIO_ENV[@]}" "${JF_HW_ARGS[@]}" -p $P_JELLYFIN:8096 \
-  -v "$APPDATA/jellyfin:/config" \
+  -v "$APPDATA/$MS_CT:/config" \
   -v "$DATA/media:/data/media" \
   -v "$MOUNT_HOST:$MOUNT_CT:rslave" \
-  "$IMG_JELLYFIN"
+  "$MS_IMG"
 
 run_ct seerr $P_SEERR "$ICON/seerr.png" -- \
   --init -e LOG_LEVEL=info -p $P_SEERR:5055 \
@@ -1962,25 +2036,41 @@ jf_set_hwaccel() {
   log "  Hardware-Beschleunigung: $JF_HW_TYPE${JF_HW_DEV:+ ($JF_HW_DEV)}"
 }
 
-log "Konfiguriere Jellyfin"
-wait_http "$JF/health"
+log "Konfiguriere $MS_LABEL"
+# Jellyfin: Standard-Header "Authorization" (Jellyfin 12 lehnt die alten ab)
+# Emby:     X-Emby-Authorization / X-Emby-Token, API unter /emby
+[[ $MS_CT == emby ]] && JF="$JF/emby"
 JF_AUTH='MediaBrowser Client="mediastack", Device="setup", DeviceId="mediastack-setup", Version="1.0"'
-jfc() { local m=$1 u=$2 d=${3:-}; http "$m" "$JF$u" "$d" -H "Authorization: $JF_AUTH${JF_TOKEN:+, Token=\"$JF_TOKEN\"}"; }
+jfc() {
+  local m=$1 u=$2 d=${3:-} h=()
+  if [[ $MS_CT == emby ]]; then
+    h=(-H "X-Emby-Authorization: $JF_AUTH"); [[ -n ${JF_TOKEN:-} ]] && h+=(-H "X-Emby-Token: $JF_TOKEN")
+  else
+    h=(-H "Authorization: $JF_AUTH${JF_TOKEN:+, Token=\"$JF_TOKEN\"}")
+  fi
+  http "$m" "$JF$u" "$d" "${h[@]}"
+}
+jf_login() {
+  jfc POST /Users/AuthenticateByName \
+    "$(jq -nc --arg u "$ADMIN_USER" --arg p "$ADMIN_PASS" '{Username:$u,Pw:$p}')" 2>/dev/null | jq -r '.AccessToken // empty'
+}
 
 JF_TOKEN=""
-wait_http "$JF/System/Info/Public" || die "Jellyfin antwortet nicht – Logs: docker logs jellyfin"
-if [[ $(jfc GET /System/Info/Public | jq -r .StartupWizardCompleted) != true ]]; then
+wait_http "$JF/System/Info/Public" || die "$MS_LABEL antwortet nicht – Logs: docker logs $MS_CT"
+sleep 3
+# Einrichtungsassistent nur, wenn der Admin-Login noch nicht funktioniert
+if [[ -z $(jf_login) ]]; then
   jfc POST /Startup/Configuration "$(jq -nc --arg l "$LANG_CODE" --arg c "$COUNTRY_CODE" \
-       '{UICulture:$l,MetadataCountryCode:$c,PreferredMetadataLanguage:$l}')" >/dev/null
-  jfc GET  /Startup/User >/dev/null
-  jfc POST /Startup/User "$(jq -nc --arg u "$ADMIN_USER" --arg p "$ADMIN_PASS" '{Name:$u,Password:$p}')" >/dev/null
-  jfc POST /Startup/RemoteAccess '{"EnableRemoteAccess":true,"EnableAutomaticPortMapping":false}' >/dev/null
-  jfc POST /Startup/Complete >/dev/null
+       '{UICulture:$l,MetadataCountryCode:$c,PreferredMetadataLanguage:$l}')" >/dev/null || true
+  jfc GET  /Startup/User >/dev/null || true
+  jfc POST /Startup/User "$(jq -nc --arg u "$ADMIN_USER" --arg p "$ADMIN_PASS" '{Name:$u,Password:$p}')" >/dev/null || true
+  jfc POST /Startup/RemoteAccess '{"EnableRemoteAccess":true,"EnableAutomaticPortMapping":false}' >/dev/null 2>&1 || true
+  jfc POST /Startup/Complete >/dev/null || true
   log "  Einrichtungsassistent abgeschlossen"
+  sleep 3
 fi
 
-JF_TOKEN=$(jfc POST /Users/AuthenticateByName \
-  "$(jq -nc --arg u "$ADMIN_USER" --arg p "$ADMIN_PASS" '{Username:$u,Pw:$p}')" | jq -r .AccessToken) || JF_TOKEN=""
+JF_TOKEN=$(jf_login) || JF_TOKEN=""
 JF_KEY=""
 if [[ -n $JF_TOKEN && $JF_TOKEN != null ]]; then
   existing=$(jfc GET /Library/VirtualFolders | jq -r '.[].Name')
@@ -1996,25 +2086,41 @@ if [[ -n $JF_TOKEN && $JF_TOKEN != null ]]; then
   add_lib Filme  movies  /data/media/movies
   add_lib Serien tvshows /data/media/tv
   [[ $WHISPARR_ENABLED == true ]] && add_lib "$ADULT_LIB" movies /data/media/adult
-  jf_set_hwaccel || warn "  Hardware-Beschleunigung konnte nicht gesetzt werden – Dashboard → Wiedergabe → Transcoding"
+  if [[ $MS_CT == jellyfin ]]; then
+    jf_set_hwaccel || warn "  Hardware-Beschleunigung konnte nicht gesetzt werden – Dashboard → Wiedergabe → Transcoding"
+  elif [[ $JF_HW_TYPE != none ]]; then
+    log "  GPU an Emby durchgereicht ($JF_HW_TYPE). Aktivieren: Emby → Einstellungen → Transcodierung (benötigt Emby Premiere)"
+  fi
 
   JF_KEY=$(jfc GET /Auth/Keys | jq -r '[.Items[] | select(.AppName=="mediastack")][0].AccessToken // empty')
   if [[ -z $JF_KEY ]]; then
-    jfc POST "/Auth/Keys?app=mediastack" >/dev/null
+    jfc POST "/Auth/Keys?App=mediastack" >/dev/null
     JF_KEY=$(jfc GET /Auth/Keys | jq -r '[.Items[] | select(.AppName=="mediastack")][0].AccessToken // empty')
   fi
   [[ -n $JF_KEY ]] && save_secret JF_KEY "$JF_KEY"
-  [[ $WHISPARR_ENABLED == true ]] && jf_restrict_adult "$JF_KEY"
+  if [[ $WHISPARR_ENABLED == true ]]; then
+    if [[ $MS_CT == jellyfin ]]; then jf_restrict_adult "$JF_KEY"
+    else warn "  Emby: Bibliothek „$ADULT_LIB“ bitte selbst für Nicht-Admins ausblenden (Benutzer → Zugriff auf Bibliotheken)"; fi
+  fi
 else
-  warn "  Jellyfin-Login fehlgeschlagen (bestehende Instanz mit anderem Passwort?) – Bibliotheken bitte manuell anlegen."
+  warn "  $MS_LABEL-Login fehlgeschlagen (bestehende Instanz mit anderem Passwort?) – Bibliotheken bitte manuell anlegen."
 fi
 
 if [[ -n $JF_KEY ]]; then
   NOTIF_TOP='{"onDownload":true,"onUpgrade":true,"onRename":true,"onMovieDelete":true,"onMovieFileDelete":true,"onSeriesDelete":true,"onEpisodeFileDelete":true}'
   NOTIF_F=$(jq -nc --arg h "$SERVER_IP" --argjson p $P_JELLYFIN --arg k "$JF_KEY" \
             '{host:$h,port:$p,useSsl:false,apiKey:$k,notify:false,updateLibrary:true}')
-  arr_add "$KEY_RADARR" "$RA/api/v3" notification MediaBrowser Jellyfin "$NOTIF_F" "$NOTIF_TOP" || true
-  arr_add "$KEY_SONARR" "$SO/api/v3" notification MediaBrowser Jellyfin "$NOTIF_F" "$NOTIF_TOP" || true
+  for _a in "$KEY_RADARR|$RA/api/v3" "$KEY_SONARR|$SO/api/v3"; do
+    _k=${_a%%|*}; _b=${_a#*|}
+    # Eintrag des anderen Mediaservers entfernen; eigenen bei geändertem Key erneuern
+    for _id in $(arr "$_k" GET "$_b/notification" | jq -r --arg n "$MS_LABEL" --arg key "$JF_KEY" '
+        .[] | select(.implementation == "MediaBrowser")
+        | select((.name == "Jellyfin" or .name == "Emby")
+                 and (.name != $n or ((.fields[]? | select(.name == "apiKey") | .value) != $key))) | .id' 2>/dev/null); do
+      arr "$_k" DELETE "$_b/notification/$_id" >/dev/null || true
+    done
+    arr_add "$_k" "$_b" notification MediaBrowser "$MS_LABEL" "$NOTIF_F" "$NOTIF_TOP" || true
+  done
 fi
 
 # ------------------------------- 9. Seerr ------------------------------------
@@ -2028,7 +2134,7 @@ se() { local m=$1 u=$2 d=${3:-}; http "$m" "$SE/api/v1$u" "$d" -b "$JAR" -c "$JA
 seerr_libraries() {
   local libs id ids
   if libs=$(se POST /settings/jellyfin/library/sync 2>/dev/null); then
-    [[ $(jq length <<<"$libs") -gt 0 ]] || { warn "  Jellyfin hat keine Film-/Serien-Bibliotheken"; return 1; }
+    [[ $(jq length <<<"$libs") -gt 0 ]] || { warn "  $MS_LABEL hat keine Film-/Serien-Bibliotheken"; return 1; }
     for id in $(jq -r '.[].id' <<<"$libs"); do
       se PUT "/settings/jellyfin/library/$id" '{"enabled":true}' >/dev/null || return 1
     done
@@ -2036,7 +2142,7 @@ seerr_libraries() {
     ids=$(se GET "/settings/jellyfin/library?sync=true" | jq -r '[.[].id] | join(",")') || return 1
     se GET "/settings/jellyfin/library?enable=$ids" >/dev/null || return 1
   fi
-  log "  Seerr: Jellyfin-Bibliotheken aktiviert"
+  log "  Seerr: $MS_LABEL-Bibliotheken aktiviert"
 }
 
 seerr_setup() {
@@ -2044,7 +2150,8 @@ seerr_setup() {
   # Einrichtung), lehnt Seerr "hostname" ab -> dann ohne Host erneut.
   se POST /auth/jellyfin "$(jq -nc --arg u "$ADMIN_USER" --arg p "$ADMIN_PASS" --arg h "$SERVER_IP" \
      --argjson port $P_JELLYFIN --arg e "$ADMIN_EMAIL" \
-     '{username:$u,password:$p,hostname:$h,port:$port,useSsl:false,urlBase:"",email:$e,serverType:2}')" >/dev/null 2>&1 \
+     --argjson st "$MS_SEERR_TYPE" \
+     '{username:$u,password:$p,hostname:$h,port:$port,useSsl:false,urlBase:"",email:$e,serverType:$st}')" >/dev/null 2>&1 \
   || se POST /auth/jellyfin "$(jq -nc --arg u "$ADMIN_USER" --arg p "$ADMIN_PASS" '{username:$u,password:$p}')" >/dev/null \
   || return 1
   seerr_libraries || return 1
@@ -2090,9 +2197,9 @@ if [[ $(se GET /settings/public | jq -r .initialized) == true ]]; then
     seerr_use_profile || warn "  Seerr-Profil konnte nicht umgestellt werden (Login?) – in Seerr unter Einstellungen → Dienste anpassen."
   fi
 elif seerr_setup; then
-  log "  Seerr mit Jellyfin, Radarr und Sonarr verbunden"
+  log "  Seerr mit $MS_LABEL, Radarr und Sonarr verbunden"
 else
-  warn "  Seerr-Automatik fehlgeschlagen – Assistent unter $SE kurz manuell durchklicken (Jellyfin: $JF)."
+  warn "  Seerr-Automatik fehlgeschlagen – Assistent unter $SE kurz manuell durchklicken ($MS_LABEL: http://$SERVER_IP:$P_JELLYFIN)."
 fi
 rm -f "$JAR"
 
@@ -2118,7 +2225,7 @@ cat <<EOF
 ${c_b}════════════ Media-Stack bereit ════════════${c_0}
 $([[ $DASHBOARD_ENABLED == true ]] && echo "  Dashboard   http://$SERVER_IP:$P_DASHBOARD   ← alle Links + API-Keys")
   Seerr       $SE        ← hier Filme/Serien anfragen
-  Jellyfin    $JF
+  $(printf '%-11s' "$MS_LABEL") http://$SERVER_IP:$P_JELLYFIN
   Radarr      $RA
   Sonarr      $SO
   Prowlarr    $PR

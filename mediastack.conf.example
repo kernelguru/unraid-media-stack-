@@ -16,6 +16,10 @@
 # Debian/Ubuntu: Docker aus dem offiziellen Repository installieren
 #INSTALL_DOCKER=true
 
+# Mediaserver: jellyfin | emby (leer = bei Erstinstallation fragen, dann gespeicherte Wahl)
+# Wechsel später: bash mediastack.sh mediaserver emby
+#MEDIASERVER=""
+
 # Jellyfin Hardware-Beschleunigung: auto | none | qsv | vaapi | nvenc
 #JELLYFIN_HWACCEL="auto"
 #JELLYFIN_HWACCEL_FORCE=false
