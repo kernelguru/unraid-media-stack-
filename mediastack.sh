@@ -22,7 +22,7 @@
 #  "mediastack.conf" neben das Script legen (wird automatisch geladen).
 # =============================================================================
 set -Eeuo pipefail
-SCRIPT_VERSION="2.5.0"
+SCRIPT_VERSION="2.5.1"
 REPO_RAW="https://raw.githubusercontent.com/kernelguru/unraid-media-stack-/main"
 
 # ------------------------------- KONFIGURATION -------------------------------
@@ -925,6 +925,13 @@ detect_hwaccel() {
   if [[ -e /dev/dri/renderD128 ]]; then
     vendor=$(cat /sys/class/drm/renderD128/device/vendor 2>/dev/null || true)
     JF_HW_ARGS=(--device /dev/dri); JF_HW_DEV=/dev/dri/renderD128
+    # Gruppen der GPU-Geräte (render/video) – sonst darf der Container-User sie nicht öffnen
+    local g gids=()
+    for d in /dev/dri/renderD* /dev/dri/card*; do
+      [[ -e $d ]] || continue
+      g=$(stat -c %g "$d"); [[ $g != 0 && " ${gids[*]} " != *" $g "* ]] && gids+=("$g")
+    done
+    for g in "${gids[@]}"; do JF_HW_ARGS+=(--group-add "$g"); done
     case $want in
       qsv|vaapi) JF_HW_TYPE=$want ;;
       *) if [[ $vendor == 0x8086 ]]; then JF_HW_TYPE=qsv; else JF_HW_TYPE=vaapi; fi ;;
