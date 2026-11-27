@@ -21,7 +21,7 @@
 #  "mediastack.conf" neben das Script legen (wird automatisch geladen).
 # =============================================================================
 set -Eeuo pipefail
-SCRIPT_VERSION="2.3.1"
+SCRIPT_VERSION="2.4.0"
 REPO_RAW="https://raw.githubusercontent.com/kernelguru/unraid-media-stack-/main"
 
 # ------------------------------- KONFIGURATION -------------------------------
@@ -73,6 +73,8 @@ COUNTRY_CODE="DE"
 
 CAT_MOVIES="movies"                  # Kategorien in InfiniDysk (SABnzbd-Tab)
 CAT_TV="tv"
+CAT_ADULT="adult"
+ADULT_LIB="Adult"
 # rclone-Mount nach InfiniDysk-Doku (Guide "Mount WebDAV with rclone")
 RCLONE_CACHE_SIZE="50G"              # --vfs-cache-max-size
 RCLONE_CACHE_MAX_AGE="1w"            # --vfs-cache-max-age
@@ -107,10 +109,11 @@ IMG_JELLYFIN="lscr.io/linuxserver/jellyfin:latest"
 IMG_SEERR="ghcr.io/seerr-team/seerr:latest"
 IMG_RECYCLARR="ghcr.io/recyclarr/recyclarr:8"    # "latest" wird nicht mehr gepflegt
 IMG_DASHBOARD="nginx:alpine"
+IMG_WHISPARR="ghcr.io/hotio/whisparr:v3"
 
 # Ports
 P_INFINIDYSK=3000; P_PROWLARR=9696; P_RADARR=7878; P_DASHBOARD=8090
-P_SONARR=8989;     P_JELLYFIN=8096; P_SEERR=5055
+P_SONARR=8989;     P_JELLYFIN=8096; P_SEERR=5055; P_WHISPARR=6969
 
 # TRaSH-Guides per Recyclarr (Qualitätsprofile + Custom Formats)
 RECYCLARR_ENABLED=true
@@ -187,7 +190,9 @@ host_mode() { [[ $RCLONE_MODE == plugin || $RCLONE_MODE == systemd ]]; }
 
 STATE_DIR="$APPDATA/mediastack"
 SECRETS="$STATE_DIR/secrets.env"
-CONTAINERS=(dashboard seerr jellyfin recyclarr sonarr radarr prowlarr rclone-nzbdav infinidysk)
+# Versteckter Schalter: bash mediastack.sh whisparr on|off
+WHISPARR_ENABLED=false; [[ -f $STATE_DIR/.whisparr ]] && WHISPARR_ENABLED=true
+CONTAINERS=(dashboard seerr jellyfin recyclarr whisparr sonarr radarr prowlarr rclone-nzbdav infinidysk)
 
 # ------------------------------- Hilfsfunktionen -----------------------------
 c_g=$'\e[32m'; c_y=$'\e[33m'; c_r=$'\e[31m'; c_b=$'\e[1m'; c_0=$'\e[0m'
@@ -463,6 +468,7 @@ write_mount_status() {  # rc [detail]
 # Die Apps werden über 127.0.0.1 geprüft (in den Allowed Hosts enthalten).
 DASH_CHECKS=("Seerr|$P_SEERR|/api/v1/status" "Jellyfin|$P_JELLYFIN|/health" "Radarr|$P_RADARR|/ping"
              "Sonarr|$P_SONARR|/ping" "Prowlarr|$P_PROWLARR|/ping" "InfiniDysk|$P_INFINIDYSK|/")
+[[ $WHISPARR_ENABLED == true ]] && DASH_CHECKS+=("Whisparr|$P_WHISPARR|/ping")
 write_status_json() {
   [[ $DASHBOARD_ENABLED == true && -d $DASH_DIR ]] || return 0
   local e name port path code apps='{}' mok=false detail="" doc='{}'
@@ -550,6 +556,12 @@ write_dashboard() {
       app("Prowlarr";   "Indexer";                     $ppr; "/ping";          "prowlarr";  $kpr),
       app("InfiniDysk"; "Usenet-Streaming";          $pnd; "/";              "nzbget";    $knd)
     ]}' > "$DASH_DIR/apps.json"
+  if [[ $WHISPARR_ENABLED == true ]]; then
+    local wkey; wkey=$(sed -n 's:.*<ApiKey>\(.*\)</ApiKey>.*:\1:p' "$APPDATA/whisparr/config.xml" 2>/dev/null)
+    jq --arg u "http://$SERVER_IP:$P_WHISPARR/" --arg i "$ICON/whisparr.png" --arg k "$wkey" \
+       '.apps += [{name:"Whisparr", desc:"Adult", url:$u, ping:($u + "ping"), icon:$i, key:$k}]' \
+       "$DASH_DIR/apps.json" > "$DASH_DIR/apps.json.tmp" && mv -f "$DASH_DIR/apps.json.tmp" "$DASH_DIR/apps.json"
+  fi
   chmod 644 "$DASH_DIR/apps.json"
 
   cat > "$DASH_DIR/index.html" <<'HTML'
@@ -701,6 +713,36 @@ radarr_fix_profile_language() {  # [quiet]
       warn "  Radarr: Profil „$name“ hat Sprache „$lang“ statt „Any“ – deutsche Releases englischer Filme werden abgelehnt"
     fi
   done < <(jq -r '.[] | [.id, .name, (.language.name // "?")] | @tsv' <<<"$profiles")
+}
+
+# ---- Jellyfin: Bibliothek $ADULT_LIB nur für Administratoren ---------------------
+# Neue Jellyfin-Benutzer sehen standardmäßig alle Bibliotheken. Deshalb wird bei
+# jedem Lauf (und im Watchdog) für alle Nicht-Admins die Bibliothek entzogen.
+jf_restrict_adult() {  # api-key|token
+  local key=$1 jf="http://$SERVER_IP:$P_JELLYFIN" auth libs adult all users uid pol new
+  [[ -n $key ]] || return 0
+  auth="Authorization: MediaBrowser Client=\"mediastack\", Device=\"setup\", DeviceId=\"mediastack-setup\", Version=\"1.0\", Token=\"$key\""
+  libs=$(curl -s -m 10 -H "$auth" "$jf/Library/VirtualFolders") || return 0
+  jq -e 'type == "array"' >/dev/null 2>&1 <<<"$libs" || return 0
+  adult=$(jq -r --arg n "$ADULT_LIB" '.[] | select(.Name == $n) | .ItemId | gsub("-"; "") | ascii_downcase' <<<"$libs")
+  [[ -n $adult ]] || return 0
+  all=$(jq -c '[.[].ItemId | gsub("-"; "") | ascii_downcase]' <<<"$libs")
+  users=$(curl -s -m 10 -H "$auth" "$jf/Users") || return 0
+  jq -e 'type == "array"' >/dev/null 2>&1 <<<"$users" || return 0
+  while IFS=$'\t' read -r uid name; do
+    [[ -n $uid ]] || continue
+    pol=$(jq -c --arg id "$uid" '.[] | select(.Id == $id) | .Policy' <<<"$users")
+    new=$(jq -c --arg a "$adult" --argjson all "$all" '
+      def norm: map(gsub("-"; "") | ascii_downcase);
+      if .EnableAllFolders then .EnableAllFolders = false | .EnabledFolders = ($all - [$a])
+      elif ((.EnabledFolders // []) | norm | index($a)) then .EnabledFolders = ((.EnabledFolders // []) | norm | map(select(. != $a)))
+      else empty end' <<<"$pol")
+    [[ -n $new ]] || continue
+    if curl -s -o /dev/null -m 10 -w '%{http_code}' -X POST -H "$auth" -H 'Content-Type: application/json' \
+         --data "$new" "$jf/Users/$uid/Policy" | grep -q '^2'; then
+      dmsg "  Jellyfin: Bibliothek „$ADULT_LIB“ für Benutzer „$name“ ausgeblendet"
+    fi
+  done < <(jq -r '.[] | select(.Policy.IsAdministrator | not) | [.Id, .Name] | @tsv' <<<"$users")
 }
 
 # ------------------------------- Mount-Diagnose / Reparatur ------------------
@@ -1326,6 +1368,7 @@ case "$CMD" in
     DOC_AUTO=1; DOC_QUIET=1
     run_doctor; rc=$?; write_mount_status "$rc" "$LAST_BAD"
     [[ $RECYCLARR_ENABLED == true && $TRASH_ANY_GERMAN == true ]] && radarr_fix_profile_language quiet
+    [[ $WHISPARR_ENABLED == true ]] && jf_restrict_adult "${JF_KEY:-}"
     exit $rc ;;
   dashboard-status)
     trap - ERR; set +e
@@ -1363,6 +1406,18 @@ case "$CMD" in
       exists "$c" && remove_ct "$c" && log "$c entfernt – wird neu angelegt"
     done ;;
   install)  ;;
+  whisparr)
+    [[ $EUID -eq 0 ]] || die "Bitte als root ausführen."
+    case "${1:-}" in
+      on)  mkdir -p "$STATE_DIR"; touch "$STATE_DIR/.whisparr"
+           [[ $WHISPARR_ENABLED == true ]] || DASH_CHECKS+=("Whisparr|$P_WHISPARR|/ping")
+           WHISPARR_ENABLED=true
+           log "Whisparr wird eingerichtet" ;;
+      off) rm -f "$STATE_DIR/.whisparr"; WHISPARR_ENABLED=false
+           _dc=(); for e in "${DASH_CHECKS[@]}"; do [[ $e == Whisparr\|* ]] || _dc+=("$e"); done; DASH_CHECKS=("${_dc[@]}")
+           exists whisparr && remove_ct whisparr && log "whisparr entfernt (Daten bleiben in $APPDATA/whisparr)" ;;
+      *)   die "Aufruf: bash $SELF_NAME whisparr on|off" ;;
+    esac ;;
   help|-h|--help) usage; exit 0 ;;
   *) usage; die "Unbekannter Befehl: $CMD" ;;
 esac
@@ -1418,6 +1473,10 @@ mkdir -p "$DATA/media/movies" "$DATA/media/tv" \
 chown "$PUID:$PGID" "$DATA" "$DATA/media" "$DATA/media/movies" "$DATA/media/tv"
 chown -R "$PUID:$PGID" "$APPDATA"/{infinidysk,prowlarr,radarr,sonarr,jellyfin}
 chown -R 1000:1000 "$APPDATA/seerr"     # Seerr läuft als UID 1000
+if [[ $WHISPARR_ENABLED == true ]]; then
+  mkdir -p "$DATA/media/adult" "$APPDATA/whisparr"
+  chown "$PUID:$PGID" "$DATA/media/adult"; chown -R "$PUID:$PGID" "$APPDATA/whisparr"
+fi
 
 # ------------------------------- 2. Mount-Propagation ------------------------
 # Damit der rclone-Mount aus dem Container auf dem Host und in den anderen
@@ -1454,6 +1513,7 @@ EOF
 seed_arr prowlarr $P_PROWLARR
 seed_arr radarr   $P_RADARR
 seed_arr sonarr   $P_SONARR
+[[ $WHISPARR_ENABLED == true ]] && seed_arr whisparr $P_WHISPARR
 
 LSIO_ENV=(-e PUID="$PUID" -e PGID="$PGID" -e UMASK="$UMASK")
 
@@ -1591,6 +1651,15 @@ for app in radarr sonarr; do
     "${!img_var}"
 done
 
+if [[ $WHISPARR_ENABLED == true ]]; then
+  run_ct whisparr "$P_WHISPARR" "$ICON/whisparr.png" -- \
+    "${LSIO_ENV[@]}" -p "$P_WHISPARR:6969" \
+    -v "$APPDATA/whisparr:/config" \
+    -v "$DATA:/data" \
+    -v "$MOUNT_HOST:$MOUNT_CT:rslave" \
+    "$IMG_WHISPARR"
+fi
+
 detect_hwaccel
 log "Jellyfin Hardware-Beschleunigung: $JF_HW_TYPE${JF_HW_DEV:+ ($JF_HW_DEV)}"
 run_ct jellyfin $P_JELLYFIN "$ICON/jellyfin.png" -- \
@@ -1608,6 +1677,8 @@ PR="http://$SERVER_IP:$P_PROWLARR"; RA="http://$SERVER_IP:$P_RADARR"
 SO="http://$SERVER_IP:$P_SONARR";   JF="http://$SERVER_IP:$P_JELLYFIN"
 SE="http://$SERVER_IP:$P_SEERR"
 wait_http "$PR/ping"; wait_http "$RA/ping"; wait_http "$SO/ping"
+WH="http://$SERVER_IP:$P_WHISPARR"
+[[ $WHISPARR_ENABLED == true ]] && wait_http "$WH/ping"
 
 # ------------------------------- 7. *arr konfigurieren -----------------------
 # Eintrag aus Schema anlegen, falls Name noch nicht existiert
@@ -1657,15 +1728,44 @@ for app in radarr sonarr; do
       "$(jq -c '.enableMediaInfo=false' <<<"$mm")" >/dev/null || warn "  Media-Management nicht gesetzt"
 done
 
+if [[ $WHISPARR_ENABLED == true ]]; then
+  K=$KEY_WHISPARR; B="$WH/api/v3"
+  log "Konfiguriere Whisparr"
+  set_auth "$K" "$B" || warn "  Login konnte nicht gesetzt werden"
+  if ! arr "$K" GET "$B/rootfolder" | jq -e 'any(.[]; .path=="/data/media/adult")' >/dev/null; then
+    arr "$K" POST "$B/rootfolder" '{"path":"/data/media/adult"}' >/dev/null && log "  Root-Ordner /data/media/adult"
+  fi
+  # Kategorie-Feld je nach Whisparr-Version unterschiedlich benannt -> alle setzen
+  arr_add "$K" "$B" downloadclient Sabnzbd InfiniDysk \
+    "$(jq -nc --arg h "$SERVER_IP" --argjson p $P_INFINIDYSK --arg k "$NZBDAV_API_KEY" --arg c "$CAT_ADULT" \
+         '{host:$h,port:$p,apiKey:$k,useSsl:false,urlBase:"",movieCategory:$c,tvCategory:$c,category:$c}')" \
+    '{"priority":1,"removeCompletedDownloads":true,"removeFailedDownloads":true}' || true
+  mm=$(arr "$K" GET "$B/config/mediamanagement") && \
+  arr "$K" PUT "$B/config/mediamanagement/$(jq -r .id <<<"$mm")" \
+      "$(jq -c '.enableMediaInfo=false' <<<"$mm")" >/dev/null || true
+  warn "  In InfiniDysk (SABnzbd-Tab) die Kategorie „$CAT_ADULT“ ergänzen, falls noch nicht geschehen."
+fi
+
 log "Konfiguriere Prowlarr"
 PB="$PR/api/v1"
 set_auth "$KEY_PROWLARR" "$PB" || warn "  Login konnte nicht gesetzt werden"
-for app in Radarr Sonarr; do
-  [[ $app == Radarr ]] && { u=$RA; k=$KEY_RADARR; } || { u=$SO; k=$KEY_SONARR; }
+PR_APPS=(Radarr Sonarr); [[ $WHISPARR_ENABLED == true ]] && PR_APPS+=(Whisparr)
+for app in "${PR_APPS[@]}"; do
+  case $app in
+    Radarr)   u=$RA; k=$KEY_RADARR ;;
+    Sonarr)   u=$SO; k=$KEY_SONARR ;;
+    Whisparr) u=$WH; k=$KEY_WHISPARR ;;
+  esac
   arr_add "$KEY_PROWLARR" "$PB" applications "$app" "$app" \
     "$(jq -nc --arg pu "$PR" --arg bu "$u" --arg k "$k" '{prowlarrUrl:$pu,baseUrl:$bu,apiKey:$k}')" \
     '{"syncLevel":"fullSync"}' || true
 done
+# Whisparr abgeschaltet: App-Eintrag in Prowlarr entfernen
+if [[ $WHISPARR_ENABLED != true ]]; then
+  for id in $(arr "$KEY_PROWLARR" GET "$PB/applications" | jq -r --arg u "$WH" '.[] | select(.name=="Whisparr" and ((.fields[]? | select(.name=="baseUrl") | .value) == $u)) | .id' 2>/dev/null); do
+    arr "$KEY_PROWLARR" DELETE "$PB/applications/$id" >/dev/null && log "  Whisparr aus Prowlarr entfernt"
+  done
+fi
 for entry in "${INDEXERS[@]}"; do
   IFS='|' read -r iname iurl ikey <<<"$entry"
   if arr "$KEY_PROWLARR" GET "$PB/indexer" | jq -e --arg n "$iname" 'any(.[]; .name==$n)' >/dev/null; then continue; fi
@@ -1895,6 +1995,7 @@ if [[ -n $JF_TOKEN && $JF_TOKEN != null ]]; then
   }
   add_lib Filme  movies  /data/media/movies
   add_lib Serien tvshows /data/media/tv
+  [[ $WHISPARR_ENABLED == true ]] && add_lib "$ADULT_LIB" movies /data/media/adult
   jf_set_hwaccel || warn "  Hardware-Beschleunigung konnte nicht gesetzt werden – Dashboard → Wiedergabe → Transcoding"
 
   JF_KEY=$(jfc GET /Auth/Keys | jq -r '[.Items[] | select(.AppName=="mediastack")][0].AccessToken // empty')
@@ -1902,6 +2003,8 @@ if [[ -n $JF_TOKEN && $JF_TOKEN != null ]]; then
     jfc POST "/Auth/Keys?app=mediastack" >/dev/null
     JF_KEY=$(jfc GET /Auth/Keys | jq -r '[.Items[] | select(.AppName=="mediastack")][0].AccessToken // empty')
   fi
+  [[ -n $JF_KEY ]] && save_secret JF_KEY "$JF_KEY"
+  [[ $WHISPARR_ENABLED == true ]] && jf_restrict_adult "$JF_KEY"
 else
   warn "  Jellyfin-Login fehlgeschlagen (bestehende Instanz mit anderem Passwort?) – Bibliotheken bitte manuell anlegen."
 fi
