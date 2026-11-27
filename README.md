@@ -41,8 +41,9 @@ Unter `http://<server-ip>:8090` liegt eine kleine Übersichtsseite (Container `d
 
 - Links zu Seerr, Jellyfin, Radarr, Sonarr, Prowlarr und InfiniDysk
 - **API-Keys** verdeckt, mit Knöpfen zum Einblenden (👁) und **Kopieren**
-- **Online-Status** je App (grün/rot), wird jede Minute aktualisiert
-- **rclone-Mount-Status** aus der letzten Prüfung von Watchdog bzw. `doctor`
+- **Online-Status** je App (grün/rot) und **rclone-Mount-Status**
+
+Der Status wird **auf dem Server** geprüft, nicht im Browser. Ein Job läuft jede Minute (`bash mediastack.sh dashboard-status`), fragt die Apps über `127.0.0.1` ab, prüft den Mount und schreibt das Ergebnis nach `status.json`. Die Seite liest nur diese Datei. Deshalb funktioniert sie lokal genauso wie über HTTPS oder einen Reverse Proxy. Der Job läuft unter Unraid per Cron (`/boot/config/plugins/dynamix/mediastack-dashboard.cron`), unter Debian/Ubuntu als `mediastack-dashboard.timer`. Ist der Status älter als 5 Minuten, zeigt die Seite graue Punkte und einen Hinweis.
 
 > Die Seite hat **keinen Login**. Jeder im LAN kann die API-Keys sehen. Port 8090 deshalb **nicht** ins Internet freigeben und auch nicht über einen Reverse Proxy veröffentlichen.
 

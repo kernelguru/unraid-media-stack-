@@ -14,13 +14,14 @@
 #    bash mediastack.sh status          -> Container-Status anzeigen
 #    bash mediastack.sh doctor [--yes]  -> rclone-Mount prüfen + reparieren
 #    bash mediastack.sh watchdog pause|resume -> Mount-Überwachung pausieren
+#    bash mediastack.sh dashboard-status -> Status fürs Dashboard schreiben (läuft minütlich)
 #    bash mediastack.sh remove          -> Container entfernen (Daten bleiben!)
 #
 #  Eigene Werte: entweder unten im Block "KONFIGURATION" ändern oder eine Datei
 #  "mediastack.conf" neben das Script legen (wird automatisch geladen).
 # =============================================================================
 set -Eeuo pipefail
-SCRIPT_VERSION="2.1.0"
+SCRIPT_VERSION="2.2.0"
 REPO_RAW="https://raw.githubusercontent.com/kernelguru/unraid-media-stack-/main"
 
 # ------------------------------- KONFIGURATION -------------------------------
@@ -328,13 +329,87 @@ arr_allowed_hosts() {
 # ---- Dashboard ------------------------------------------------------------------
 DASH_DIR="$STATE_DIR/dashboard"
 
-# Mount-Status für das Dashboard (von doctor/watchdog/Installation geschrieben)
+# Ergebnis der letzten doctor/watchdog-Prüfung merken (Detailtext bei Fehlern)
+# und status.json sofort aktualisieren
 write_mount_status() {  # rc [detail]
   [[ $DASHBOARD_ENABLED == true && -d $DASH_DIR ]] || return 0
-  jq -n --arg ok "$([[ $1 == 0 ]] && echo true || echo false)" --arg d "${2:-}" \
-        --arg t "$(date -Iseconds)" --arg m "$MOUNT_HOST" \
-     '{mount_ok: ($ok == "true"), detail: $d, checked: $t, path: $m}' > "$DASH_DIR/status.json.tmp" \
-  && mv -f "$DASH_DIR/status.json.tmp" "$DASH_DIR/status.json"
+  jq -n --arg ok "$([[ $1 == 0 ]] && echo true || echo false)" --arg d "${2:-}" --arg t "$(date -Iseconds)" \
+     '{ok: ($ok == "true"), detail: $d, checked: $t}' > "$DASH_DIR/.doctor.json.tmp" \
+  && mv -f "$DASH_DIR/.doctor.json.tmp" "$DASH_DIR/.doctor.json"
+  write_status_json
+}
+
+# status.json für das Dashboard – wird serverseitig erzeugt (minütlich per
+# Cron/Timer), damit die Seite auch über HTTPS/Reverse Proxy funktioniert.
+# Die Apps werden über 127.0.0.1 geprüft (in den Allowed Hosts enthalten).
+DASH_CHECKS=("Seerr|$P_SEERR|/api/v1/status" "Jellyfin|$P_JELLYFIN|/health" "Radarr|$P_RADARR|/ping"
+             "Sonarr|$P_SONARR|/ping" "Prowlarr|$P_PROWLARR|/ping" "InfiniDysk|$P_INFINIDYSK|/")
+write_status_json() {
+  [[ $DASHBOARD_ENABLED == true && -d $DASH_DIR ]] || return 0
+  local e name port path code apps='{}' mok=false detail="" doc='{}'
+  for e in "${DASH_CHECKS[@]}"; do
+    IFS='|' read -r name port path <<<"$e"
+    code=$(curl -s -o /dev/null -m 5 -w '%{http_code}' "http://127.0.0.1:$port$path" 2>/dev/null || true)
+    apps=$(jq -c --arg n "$name" --argjson up "$([[ $code =~ ^[2-4][0-9][0-9]$ ]] && echo true || echo false)" \
+           '. + {($n): $up}' <<<"$apps")
+  done
+  if host_healthy 2>/dev/null; then mok=true
+  else
+    [[ -f $DASH_DIR/.doctor.json ]] && detail=$(jq -r 'select(.ok|not) | .detail // empty' "$DASH_DIR/.doctor.json" 2>/dev/null || true)
+    [[ -n $detail ]] || detail="Mount leer oder nicht vorhanden"
+  fi
+  [[ -f $DASH_DIR/.doctor.json ]] && doc=$(cat "$DASH_DIR/.doctor.json")
+  jq -n --argjson apps "$apps" --argjson ok "$mok" --arg d "$detail" --arg m "$MOUNT_HOST" \
+        --arg t "$(date -Iseconds)" --argjson doc "$doc" \
+     '{checked: $t, apps: $apps, mount_ok: $ok, detail: (if $ok then "" else $d end), path: $m,
+       watchdog_checked: ($doc.checked // null)}' > "$DASH_DIR/status.json.tmp" \
+  && chmod 644 "$DASH_DIR/status.json.tmp" && mv -f "$DASH_DIR/status.json.tmp" "$DASH_DIR/status.json"
+}
+
+# Minütlicher Status-Job: Unraid per Cron (dynamix-Ordner), sonst systemd-Timer
+DASH_CRON=/boot/config/plugins/dynamix/mediastack-dashboard.cron
+DASH_SERVICE=/etc/systemd/system/mediastack-dashboard.service
+DASH_TIMER=/etc/systemd/system/mediastack-dashboard.timer
+install_dashboard_job() {
+  if [[ $PLATFORM == unraid ]]; then
+    if [[ $DASHBOARD_ENABLED == true ]]; then
+      {
+        echo "# mediastack: Dashboard-Status jede Minute"
+        printf '* * * * * [ -f %q ] && bash %q dashboard-status >/dev/null 2>&1\n' "$SELF" "$SELF"
+      } > "$DASH_CRON"
+    else
+      rm -f "$DASH_CRON"
+    fi
+    /usr/local/sbin/update_cron >/dev/null 2>&1 || true
+    return 0
+  fi
+  if [[ $DASHBOARD_ENABLED == true ]]; then
+    cat > "$DASH_SERVICE" <<EOF
+[Unit]
+Description=mediastack: Dashboard-Status schreiben
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash $SELF dashboard-status
+EOF
+    cat > "$DASH_TIMER" <<EOF
+[Unit]
+Description=mediastack: Dashboard-Status jede Minute
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target
+EOF
+    systemctl daemon-reload
+    systemctl enable --now mediastack-dashboard.timer >/dev/null 2>&1 || true
+  else
+    systemctl disable --now mediastack-dashboard.timer >/dev/null 2>&1 || true
+    rm -f "$DASH_SERVICE" "$DASH_TIMER"; systemctl daemon-reload 2>/dev/null || true
+  fi
 }
 
 write_dashboard() {
@@ -406,7 +481,7 @@ write_dashboard() {
   </header>
   <div class="mount"><span class="dot" id="mdot"></span><span id="mtext">rclone-Mount: Status wird geladen …</span></div>
   <div class="grid" id="grid"></div>
-  <footer>Status der Apps wird jede Minute aktualisiert · Mount-Status aus der letzten Watchdog-Prüfung</footer>
+  <footer id="foot">Status wird vom Server jede Minute geprüft</footer>
 </main>
 <script>
 const MASK = '••••••••••••••••';
@@ -440,35 +515,37 @@ function card(a, i) {
   return el;
 }
 
-async function ping(url) {
-  const ctl = new AbortController(); const t = setTimeout(() => ctl.abort(), 5000);
-  try { await fetch(url, { mode: 'no-cors', cache: 'no-store', signal: ctl.signal }); return true; }
-  catch { return false; } finally { clearTimeout(t); }
-}
-
-async function refreshApps(apps) {
-  apps.forEach(async (a, i) => {
-    const d = document.getElementById('d' + i), up = await ping(a.ping);
+// Status kommt vollständig vom Server (status.json, minütlich erzeugt).
+// Kein Zugriff vom Browser auf die Apps -> funktioniert auch über HTTPS/Proxy.
+async function refreshStatus(apps) {
+  const dot = document.getElementById('mdot'), txt = document.getElementById('mtext');
+  let s;
+  try { s = await (await fetch('status.json', { cache: 'no-store' })).json(); }
+  catch {
+    dot.className = 'dot'; txt.textContent = 'Status: noch keine Prüfung vorhanden';
+    apps.forEach((a, i) => { const d = document.getElementById('d' + i); d.className = 'dot'; d.title = 'unbekannt'; });
+    return;
+  }
+  const when = new Date(s.checked), age = (Date.now() - when.getTime()) / 1000, stale = age > 300;
+  const whenTxt = when.toLocaleString('de-DE');
+  apps.forEach((a, i) => {
+    const d = document.getElementById('d' + i), up = s.apps ? s.apps[a.name] : undefined;
+    if (stale || up === undefined) { d.className = 'dot'; d.title = 'unbekannt'; return; }
     d.className = 'dot ' + (up ? 'ok' : 'bad'); d.title = up ? 'online' : 'nicht erreichbar';
   });
-}
-
-async function refreshMount() {
-  const dot = document.getElementById('mdot'), txt = document.getElementById('mtext');
-  try {
-    const s = await (await fetch('status.json', { cache: 'no-store' })).json();
-    const when = new Date(s.checked).toLocaleString('de-DE');
-    dot.className = 'dot ' + (s.mount_ok ? 'ok' : 'bad');
-    txt.textContent = s.mount_ok ? `rclone-Mount ${s.path}: in Ordnung · geprüft ${when}`
-                                 : `rclone-Mount ${s.path}: ${s.detail || 'Problem'} · geprüft ${when}`;
-  } catch { dot.className = 'dot'; txt.textContent = 'rclone-Mount: noch keine Prüfung vorhanden'; }
+  dot.className = 'dot ' + (stale ? '' : (s.mount_ok ? 'ok' : 'bad'));
+  txt.textContent = s.mount_ok ? `rclone-Mount ${s.path}: in Ordnung · geprüft ${whenTxt}`
+                               : `rclone-Mount ${s.path}: ${s.detail || 'Problem'} · geprüft ${whenTxt}`;
+  document.getElementById('foot').textContent = stale
+    ? `Status veraltet (letzte Prüfung ${whenTxt}) – läuft der Status-Job auf dem Server?`
+    : 'Status wird vom Server jede Minute geprüft';
 }
 
 fetch('apps.json', { cache: 'no-store' }).then(r => r.json()).then(cfg => {
   document.getElementById('meta').textContent = `mediastack ${cfg.version} · ${cfg.platform} · erzeugt ${cfg.generated}`;
   cfg.apps.forEach((a, i) => grid.appendChild(card(a, i)));
-  refreshApps(cfg.apps); refreshMount();
-  setInterval(() => { refreshApps(cfg.apps); refreshMount(); }, 60000);
+  refreshStatus(cfg.apps);
+  setInterval(() => refreshStatus(cfg.apps), 30000);
 });
 </script>
 </body>
@@ -1099,11 +1176,19 @@ case "$CMD" in
     flock -n 9 || exit 0                           # läuft schon
     DOC_AUTO=1; DOC_QUIET=1
     run_doctor; rc=$?; write_mount_status "$rc" "$LAST_BAD"; exit $rc ;;
+  dashboard-status)
+    trap - ERR; set +e
+    [[ $DASHBOARD_ENABLED == true && -d $DASH_DIR ]] || exit 0
+    exec 8>/var/run/mediastack-dashboard.lock
+    flock -n 8 || exit 0
+    detect_ip
+    write_status_json; exit 0 ;;
   remove)
-    rm -f "$CRON_FILE" "$CRON_OLD"; /usr/local/sbin/update_cron >/dev/null 2>&1 || true
+    rm -f "$CRON_FILE" "$CRON_OLD" "$DASH_CRON"; /usr/local/sbin/update_cron >/dev/null 2>&1 || true
     host_mode && host_unmount && log "rclone-Mount $MOUNT_HOST ausgehängt (rclone bleibt installiert)"
     if [[ $PLATFORM != unraid ]]; then
-      systemctl disable --now mediastack-mount.service mediastack-watchdog.timer >/dev/null 2>&1 || true
+      systemctl disable --now mediastack-mount.service mediastack-watchdog.timer mediastack-dashboard.timer >/dev/null 2>&1 || true
+      rm -f "$DASH_SERVICE" "$DASH_TIMER"
       rm -f "$MOUNT_UNIT" "$WD_SERVICE" "$WD_TIMER"; systemctl daemon-reload 2>/dev/null || true
     fi
     for c in "${CONTAINERS[@]}"; do exists "$c" && remove_ct "$c" && log "$c entfernt"; done
@@ -1764,8 +1849,11 @@ if [[ $DASHBOARD_ENABLED == true ]]; then
   if host_healthy 2>/dev/null; then write_mount_status 0; else write_mount_status 1 "Mount bei der Installation nicht sichtbar"; fi
   run_ct dashboard "$P_DASHBOARD" "$ICON/homepage.png" -- \
     -p "$P_DASHBOARD:80" -v "$DASH_DIR:/usr/share/nginx/html:ro" "$IMG_DASHBOARD"
+  install_dashboard_job
+  log "  Status-Job aktiv (jede Minute)"
 elif exists dashboard; then
   remove_ct dashboard
+  install_dashboard_job
 fi
 
 # ------------------------------- Fertig --------------------------------------
