@@ -279,6 +279,7 @@ Ein Abgleich von Hand geht mit `docker exec recyclarr recyclarr sync`, das Ergeb
 **Hinweise:**
 - Vorhandene Filme und Serien behalten ihr Profil. Umstellen kannst du sie in Radarr und Sonarr über *Bibliothek bearbeiten* mit Mehrfachauswahl.
 - `reset_unmatched_scores` setzt Bewertungen von Custom Formats, die nicht zum Profil gehören, auf 0.
+- **Profil-Sprache in Radarr:** Bei den [German]-Profilen regeln die Custom Formats die Sprache, die Profil-Sprache muss deshalb **„Any“** sein. Die TRaSH-Profile bringen das mit. Für „[German] Any“ kann Recyclarr v8 die Sprache noch nicht setzen, das kommt erst mit v9. Deshalb setzt das Script sie nach jedem Abgleich selbst, und der Watchdog prüft sie alle 5 Minuten. Mit „Original“ würde Radarr deutsche Releases englischer Originalfilme ablehnen.
 - Die Any-Custom-Formats sind im Script hinterlegt (`ANY_CF_RADARR` und `ANY_CF_SONARR`). Benennt TRaSH ein Format um oder entfernt es, meldet Recyclarr das im Sync-Log.
 
 ## Zusätzliche Volumes (z. B. ein weiterer Ordner für Jellyfin)

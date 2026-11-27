@@ -21,7 +21,7 @@
 #  "mediastack.conf" neben das Script legen (wird automatisch geladen).
 # =============================================================================
 set -Eeuo pipefail
-SCRIPT_VERSION="2.3.0"
+SCRIPT_VERSION="2.3.1"
 REPO_RAW="https://raw.githubusercontent.com/kernelguru/unraid-media-stack-/main"
 
 # ------------------------------- KONFIGURATION -------------------------------
@@ -673,6 +673,36 @@ HTML
   chmod 644 "$DASH_DIR/index.html"
 }
 
+# ---- Radarr: Profil-Sprache für "[German] Any" ----------------------------------
+# Die Sprache regeln bei den [German]-Profilen die Custom Formats; die
+# Profil-Sprache muss deshalb "Any" sein (wie in den TRaSH-Profilen). Recyclarr v8
+# kann die Sprache nur für TRaSH-Profile setzen, nicht für eigene – daher hier.
+# Mit "Original" lehnt Radarr deutsche Releases englischer Originale ab.
+ANY_LANG_PROFILE="[German] Any"
+radarr_fix_profile_language() {  # [quiet]
+  local key url profiles id name lang body
+  key=$(sed -n 's:.*<ApiKey>\(.*\)</ApiKey>.*:\1:p' "$APPDATA/radarr/config.xml" 2>/dev/null)
+  [[ -n $key && -n $SERVER_IP ]] || return 0
+  url="http://$SERVER_IP:$P_RADARR/api/v3"
+  profiles=$(curl -s -m 10 -H "X-Api-Key: $key" "$url/qualityprofile") || return 0
+  jq -e 'type == "array"' >/dev/null 2>&1 <<<"$profiles" || return 0
+  while IFS=$'\t' read -r id name lang; do
+    [[ -n $id ]] || continue
+    if [[ $name == "$ANY_LANG_PROFILE" ]]; then
+      [[ $lang == Any ]] && continue
+      body=$(jq -c --argjson id "$id" '.[] | select(.id == $id) | .language = {id: -1, name: "Any"}' <<<"$profiles")
+      if curl -s -o /dev/null -m 10 -w '%{http_code}' -X PUT -H "X-Api-Key: $key" -H 'Content-Type: application/json' \
+           --data "$body" "$url/qualityprofile/$id" | grep -q '^2'; then
+        dmsg "  Radarr: Sprache von „$name“ von „$lang“ auf „Any“ gesetzt"
+      else
+        dmsg "  Radarr: Sprache von „$name“ konnte nicht gesetzt werden"
+      fi
+    elif [[ $name == "[German]"* && $lang != Any && ${1:-} != quiet ]]; then
+      warn "  Radarr: Profil „$name“ hat Sprache „$lang“ statt „Any“ – deutsche Releases englischer Filme werden abgelehnt"
+    fi
+  done < <(jq -r '.[] | [.id, .name, (.language.name // "?")] | @tsv' <<<"$profiles")
+}
+
 # ------------------------------- Mount-Diagnose / Reparatur ------------------
 detect_ip() {
   [[ -n $SERVER_IP ]] || SERVER_IP=$(ip -4 route get 1.1.1.1 2>/dev/null \
@@ -1294,7 +1324,9 @@ case "$CMD" in
     exec 9>/var/run/mediastack-watchdog.lock
     flock -n 9 || exit 0                           # läuft schon
     DOC_AUTO=1; DOC_QUIET=1
-    run_doctor; rc=$?; write_mount_status "$rc" "$LAST_BAD"; exit $rc ;;
+    run_doctor; rc=$?; write_mount_status "$rc" "$LAST_BAD"
+    [[ $RECYCLARR_ENABLED == true && $TRASH_ANY_GERMAN == true ]] && radarr_fix_profile_language quiet
+    exit $rc ;;
   dashboard-status)
     trap - ERR; set +e
     [[ $DASHBOARD_ENABLED == true && -d $DASH_DIR ]] || exit 0
@@ -1804,6 +1836,7 @@ if [[ $RECYCLARR_ENABLED == true ]]; then
     warn "  Recyclarr-Abgleich mit Fehlern – Details: $RC/last-sync.log"
     tail -n 15 "$RC/last-sync.log" | sed 's/^/      /' >&2 || true
   fi
+  [[ $TRASH_ANY_GERMAN == true ]] && radarr_fix_profile_language
 fi
 
 # ------------------------------- 8. Jellyfin ---------------------------------
