@@ -1,11 +1,11 @@
 # Unraid Media Stack
 
-Ein Script, das einen kompletten **Usenet-Streaming-Media-Stack** auf Unraid installiert, die Apps miteinander verbindet und so weit vorkonfiguriert, dass danach kaum noch Handarbeit nötig ist.
+Ein Script, das einen kompletten **Usenet-Streaming-Media-Stack** auf **Unraid** oder **Debian/Ubuntu** installiert, die Apps miteinander verbindet und so weit vorkonfiguriert, dass danach kaum noch Handarbeit nötig ist. Die Plattform erkennt das Script selbst.
 
 | App | Aufgabe | Port |
 |---|---|---|
 | **InfiniDysk** (NzbDAV-Fork) | Bindet NZBs als WebDAV ein, ohne sie herunterzuladen, und stellt eine SABnzbd-kompatible API bereit | 3000 |
-| **rclone** (Unraid-Plugin) | Hängt das WebDAV von InfiniDysk auf dem Host ein (`/mnt/addons/nzbdav`) | – |
+| **rclone** (Unraid-Plugin bzw. systemd-Dienst) | Hängt das WebDAV von InfiniDysk auf dem Host ein | – |
 | **Prowlarr** | Verwaltet die Indexer und verteilt sie an Radarr/Sonarr | 9696 |
 | **Radarr** | Filme | 7878 |
 | **Sonarr** | Serien | 8989 |
@@ -29,12 +29,40 @@ Es wird nichts heruntergeladen. Radarr und Sonarr importieren nur **Symlinks**, 
 
 ## Voraussetzungen
 
-- Unraid 6.12 oder neuer, Array gestartet, Docker aktiviert
+- **Unraid** 6.12 oder neuer, Array gestartet, Docker aktiviert, **oder**
+  **Debian** 12+ bzw. **Ubuntu** 22.04+ mit systemd. Docker, rclone und die übrigen Pakete installiert das Script.
 - Zugang zu einem Usenet-Provider und mindestens ein Usenet-Indexer
-- Root-Zugang per SSH oder über das Web-Terminal
+- Root-Zugang (Unraid: SSH oder Web-Terminal · Debian/Ubuntu: `sudo`)
 - Freie Ports: 3000, 5055, 7878, 8096, 8989, 9696
 
+## Plattformen
+
+Das Script erkennt die Plattform an `/etc/unraid-version` bzw. `/etc/os-release`. Erzwingen geht mit `PLATFORM=unraid|debian` in der `mediastack.conf`.
+
+| | Unraid | Debian / Ubuntu |
+|---|---|---|
+| Configs (`APPDATA`) | `/mnt/user/appdata` | `/opt/mediastack` |
+| Medien | `/mnt/user/data/media/{movies,tv}` | `/srv/media/{movies,tv}` |
+| rclone-Mount | `/mnt/addons/nzbdav` | `/mnt/nzbdav` |
+| Benutzer (PUID:PGID) | 99:100 | Benutzer hinter `sudo`, sonst 1000:1000 |
+| rclone | Plugin aus den Community Apps | rclone.org-Paket, Dienst `mediastack-mount.service` |
+| Start nach Neustart | Unraid-Hooks + go-Datei | systemd (nach Docker, wartet auf InfiniDysk) |
+| Watchdog | Cron (`dynamix/mediastack.cron`) | systemd-Timer `mediastack-watchdog.timer` |
+| Log | `grep mediastack /var/log/syslog` | `journalctl -t mediastack` |
+| Docker | vorhanden | wird bei Bedarf aus dem offiziellen Docker-Repository installiert (`INSTALL_DOCKER=true`) |
+
+Alle Werte lassen sich in der `mediastack.conf` überschreiben. Auf Debian/Ubuntu kommen automatisch hinzu: `curl`, `jq`, `fuse3`, `gnupg`, Docker CE samt Compose-Plugin und rclone.
+
 ## Installation
+
+**Debian/Ubuntu:**
+```bash
+sudo mkdir -p /opt/mediastack-setup && cd /opt/mediastack-setup
+sudo wget https://raw.githubusercontent.com/kernelguru/unraid-media-stack-/main/mediastack.sh
+sudo bash mediastack.sh
+```
+
+**Unraid:**
 
 ```bash
 cd /mnt/user/appdata
@@ -97,6 +125,23 @@ bash mediastack.sh watchdog pause     # Mount-Überwachung pausieren (resume = f
 bash mediastack.sh remove             # Container entfernen (Configs und Medien bleiben erhalten)
 ```
 
+## Hardware-Beschleunigung (Jellyfin)
+
+Mit `JELLYFIN_HWACCEL=auto` (Standard) erkennt das Script die GPU, reicht sie an den Jellyfin-Container durch und stellt Jellyfin passend ein (*Dashboard → Wiedergabe → Transcoding*):
+
+| GPU | Jellyfin | Container |
+|---|---|---|
+| Intel (iGPU/Arc) | **QSV** inkl. HDR-Tonemapping | `--device /dev/dri` + linuxserver-Mod `jellyfin-opencl-intel` |
+| AMD | **VAAPI** | `--device /dev/dri` |
+| NVIDIA | **NVENC** inkl. Tonemapping | `--runtime=nvidia`, alle GPUs |
+
+Aktiviert werden Hardware-Encoding und -Decoding für H.264, HEVC (auch 10 Bit), MPEG-2, VC-1 und VP9 (auch 10 Bit).
+
+- **NVIDIA auf Debian/Ubuntu:** Der NVIDIA-Treiber muss installiert sein (`nvidia-smi` funktioniert). Das *NVIDIA Container Toolkit* installiert das Script dann selbst und richtet die Docker-Runtime ein.
+- **NVIDIA auf Unraid:** Dafür braucht es das Plugin *Nvidia Driver* aus den Community Apps.
+- Ist in Jellyfin schon eine Beschleunigung eingestellt, bleibt sie unverändert. Überschreiben geht mit `JELLYFIN_HWACCEL_FORCE=true`.
+- Erzwingen oder abschalten geht mit `JELLYFIN_HWACCEL=qsv|vaapi|nvenc|none`.
+
 ## rclone: Plugin oder Container
 
 Unter Unraid ist das **rclone-Plugin** aus den Community Apps ([Waseh/rclone-unraid](https://github.com/Waseh/rclone-unraid)) der zuverlässige Weg. rclone läuft dabei direkt auf dem Host, der Mount entsteht also genau dort, wo Radarr, Sonarr und Jellyfin ihn brauchen. Ein Mount, der in einem Container entsteht, kommt unter Unraid oft nicht auf dem Host an.
@@ -111,6 +156,8 @@ Unter Unraid ist das **rclone-Plugin** aus den Community Apps ([Waseh/rclone-unr
 Ein vorhandener Container `rclone-nzbdav` wird im Plugin-Modus entfernt.
 
 > Hast du das Plugin schon und hängst eigene Remotes per User Scripts ein, ist das kein Problem: Das Script nutzt nur das Remote `nzbdav` (änderbar über `RCLONE_REMOTE`). Hängt dein eigenes Skript **dasselbe** WebDAV ein, deaktiviere es, damit es nicht doppelt gemountet wird.
+
+**Debian/Ubuntu: `RCLONE_MODE="systemd"` (Standard dort).** rclone läuft vom Host als Dienst `mediastack-mount.service`. Er startet nach Docker, wartet bis zu 15 Minuten auf InfiniDysk und startet rclone bei Fehlern neu. Wichtige Befehle: `systemctl status mediastack-mount`, `journalctl -u mediastack-mount`. Konfiguration: `/opt/mediastack/rclone-nzbdav/rclone.conf`.
 
 **Alternative: `RCLONE_MODE="container"`.** rclone läuft dann im Container `rclone-nzbdav` (`--privileged --pid=host`, Mount per `nsenter` im Host-Namespace). Das ist nur sinnvoll, wenn du kein Plugin installieren willst.
 

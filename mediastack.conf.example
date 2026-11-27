@@ -1,14 +1,24 @@
 # Kopieren nach "mediastack.conf" (neben mediastack.sh) und anpassen.
 # Alles, was hier nicht steht, nimmt die Standardwerte aus dem Script.
 
+# Plattform: auto | unraid | debian
+#PLATFORM="auto"
+
 #SERVER_IP="192.168.1.10"           # leer = automatisch erkennen
 #TZ="Europe/Berlin"
-#PUID=99
-#PGID=100
+# Leer lassen = Standard der Plattform (siehe README → Plattformen)
+#PUID=""
+#PGID=""
+#APPDATA=""                          # Unraid: /mnt/user/appdata · Debian: /opt/mediastack
+#DATA=""                             # Unraid: /mnt/user/data    · Debian: /srv
+#MOUNT_HOST=""                       # Unraid: /mnt/addons/nzbdav · Debian: /mnt/nzbdav
 
-#APPDATA="/mnt/user/appdata"
-#DATA="/mnt/user/data"
-#MOUNT_HOST="/mnt/addons/nzbdav"     # NICHT unter /mnt/user!
+# Debian/Ubuntu: Docker aus dem offiziellen Repository installieren
+#INSTALL_DOCKER=true
+
+# Jellyfin Hardware-Beschleunigung: auto | none | qsv | vaapi | nvenc
+#JELLYFIN_HWACCEL="auto"
+#JELLYFIN_HWACCEL_FORCE=false
 
 #ADMIN_USER="admin"
 #ADMIN_PASS=""                       # leer = wird beim Start abgefragt
@@ -25,8 +35,8 @@
 #RCLONE_RC=false          # erst true, wenn InfiniDysk die RC-Daten kennt (README)
 #P_WEBDAV=18080           # Host-Port für den InfiniDysk-Backend-Port 8080
 
-# rclone: "plugin" (Unraid-Plugin aus den Community Apps, empfohlen) oder "container"
-#RCLONE_MODE="plugin"
+# rclone: leer = Standard (Unraid: plugin · Debian: systemd) | plugin | systemd | container
+#RCLONE_MODE=""
 #RCLONE_REMOTE="nzbdav"
 
 # Image von InfiniDysk – bitte prüfen/anpassen

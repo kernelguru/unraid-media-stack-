@@ -1,12 +1,12 @@
 #!/bin/bash
 # =============================================================================
-#  mediastack.sh – Usenet-Streaming-Media-Stack für Unraid
+#  mediastack.sh – Usenet-Streaming-Media-Stack für Unraid und Debian/Ubuntu
 #
 #  Installiert und verbindet:
 #    InfiniDysk (NzbDAV-Fork) + rclone-WebDAV-Mount
 #    Prowlarr, Radarr, Sonarr, Jellyfin, Seerr
 #
-#  Aufruf (als root im Unraid-Terminal / per SSH):
+#  Aufruf (als root bzw. mit sudo, Unraid-Terminal oder SSH):
 #    bash mediastack.sh                 -> installieren + konfigurieren (idempotent)
 #    bash mediastack.sh update          -> Images aktualisieren + geänderte Konfig übernehmen
 #    bash mediastack.sh self-update     -> Script von GitHub holen, danach "update"
@@ -20,20 +20,38 @@
 #  "mediastack.conf" neben das Script legen (wird automatisch geladen).
 # =============================================================================
 set -Eeuo pipefail
-SCRIPT_VERSION="1.9.0"
+SCRIPT_VERSION="2.0.0"
 REPO_RAW="https://raw.githubusercontent.com/kernelguru/unraid-media-stack-/main"
 
 # ------------------------------- KONFIGURATION -------------------------------
+# Plattform: auto (erkennt Unraid bzw. Debian/Ubuntu) | unraid | debian
+PLATFORM="auto"
+
 SERVER_IP=""                         # leer = automatisch erkennen
 TZ="Europe/Berlin"
-PUID=99                              # Unraid-Standard: nobody
-PGID=100                             # Unraid-Standard: users
 UMASK=002
 
-APPDATA="/mnt/user/appdata"          # Container-Configs
-DATA="/mnt/user/data"                # Medienbibliothek (media/movies, media/tv)
-MOUNT_HOST="/mnt/addons/nzbdav"      # rclone-Mount auf dem Host (NICHT unter /mnt/user!)
+# Leer = Standard der Plattform:
+#                 Unraid                  Debian/Ubuntu
+#   PUID/PGID     99 / 100                Benutzer hinter sudo, sonst 1000 / 1000
+#   APPDATA       /mnt/user/appdata       /opt/mediastack
+#   DATA          /mnt/user/data          /srv          (Medien: $DATA/media/{movies,tv})
+#   MOUNT_HOST    /mnt/addons/nzbdav      /mnt/nzbdav
+#   RCLONE_MODE   plugin                  systemd
+PUID=""
+PGID=""
+APPDATA=""                           # Container-Configs
+DATA=""                              # Medienbibliothek
+MOUNT_HOST=""                        # rclone-Mount auf dem Host
 MOUNT_CT="/mnt/nzbdav"               # derselbe Mount in allen Containern
+
+INSTALL_DOCKER=true                  # Debian/Ubuntu: Docker aus dem offiziellen Repo installieren
+
+# Hardware-Beschleunigung für Jellyfin:
+#   auto  = erkennen (NVIDIA mit Docker-Runtime → nvenc, Intel → qsv, AMD → vaapi)
+#   none | qsv | vaapi | nvenc
+JELLYFIN_HWACCEL="auto"
+JELLYFIN_HWACCEL_FORCE=false         # true = auch eine vorhandene Jellyfin-Einstellung überschreiben
 
 ADMIN_USER="admin"                   # Login für Radarr/Sonarr/Prowlarr/Jellyfin/Seerr
 ADMIN_PASS=""                        # leer = wird abgefragt
@@ -57,11 +75,13 @@ P_RCLONE_RC=5572
 # Host-Port, nur an 127.0.0.1 gebunden (rclone läuft auf dem Host).
 P_WEBDAV=18080
 
-# Wie rclone läuft:
-#   plugin    = rclone-Plugin aus den Community Apps (Waseh), Mount direkt auf
-#               dem Host – unter Unraid der zuverlässige Weg (Standard)
+# Wie rclone läuft (leer = Standard der Plattform):
+#   plugin    = Unraid: rclone-Plugin aus den Community Apps (Waseh), Mount
+#               direkt auf dem Host – unter Unraid der zuverlässige Weg
+#   systemd   = Debian/Ubuntu: rclone vom Host als systemd-Dienst
+#               (mediastack-mount.service)
 #   container = Docker-Container rclone-nzbdav (nsenter in den Host-Namespace)
-RCLONE_MODE="plugin"
+RCLONE_MODE=""
 RCLONE_REMOTE="nzbdav"               # Remote-Name in der Plugin-Konfiguration
 RCLONE_PLG_URL="https://raw.githubusercontent.com/Waseh/rclone-unraid/master/plugin/rclone.plg"
 RCLONE_PLG_CONF="/boot/config/plugins/rclone/.rclone.conf"
@@ -124,6 +144,35 @@ if (( ${#TRASH_PROFILES[@]} == 0 )); then
   else TRASH_PROFILES=(german-hd-bluray-web german-uhd-bluray-web); fi
 fi
 
+# ---- Plattform erkennen und Standardwerte setzen -------------------------------
+if [[ $PLATFORM == auto ]]; then
+  if [[ -f /etc/unraid-version ]]; then PLATFORM=unraid
+  elif [[ -r /etc/os-release ]] && grep -qiE '^(ID|ID_LIKE)=.*(debian|ubuntu)' /etc/os-release; then PLATFORM=debian
+  else PLATFORM=unknown; fi
+fi
+case $PLATFORM in
+  unraid)
+    : "${PUID:=99}" "${PGID:=100}" "${APPDATA:=/mnt/user/appdata}" "${DATA:=/mnt/user/data}"
+    : "${MOUNT_HOST:=/mnt/addons/nzbdav}" "${RCLONE_MODE:=plugin}"
+    LOGHINT="grep mediastack /var/log/syslog" ;;
+  *)
+    if [[ -z $PUID ]]; then
+      if [[ -n ${SUDO_USER:-} && $SUDO_USER != root ]] && id -u "$SUDO_USER" >/dev/null 2>&1; then
+        PUID=$(id -u "$SUDO_USER"); PGID=$(id -g "$SUDO_USER")
+      else PUID=1000; fi
+    fi
+    : "${PGID:=$PUID}" "${APPDATA:=/opt/mediastack}" "${DATA:=/srv}"
+    : "${MOUNT_HOST:=/mnt/nzbdav}" "${RCLONE_MODE:=systemd}"
+    LOGHINT="journalctl -t mediastack" ;;
+esac
+# rclone-Binary und -Konfiguration je nach Modus
+case $RCLONE_MODE in
+  plugin)  RCLONE_BIN=/usr/sbin/rcloneorig; RCLONE_CONF=$RCLONE_PLG_CONF ;;
+  systemd) RCLONE_BIN=/usr/bin/rclone;      RCLONE_CONF=$APPDATA/rclone-nzbdav/rclone.conf ;;
+  *)       RCLONE_BIN=/usr/sbin/rcloneorig; RCLONE_CONF=$APPDATA/rclone-nzbdav/rclone.conf ;;
+esac
+host_mode() { [[ $RCLONE_MODE == plugin || $RCLONE_MODE == systemd ]]; }
+
 STATE_DIR="$APPDATA/mediastack"
 SECRETS="$STATE_DIR/secrets.env"
 CONTAINERS=(seerr jellyfin recyclarr sonarr radarr prowlarr rclone-nzbdav infinidysk)
@@ -135,7 +184,7 @@ warn() { echo "${c_y}[!]${c_0} $*" >&2; }
 die()  { echo "${c_r}[x]${c_0} $*" >&2; exit 1; }
 trap 'die "Abbruch in Zeile $LINENO: $BASH_COMMAND"' ERR
 
-jq() {  # Unraid hat meist jq – sonst per Container
+jq() {  # Unraid/Debian: meist installiert – sonst per Container
   if command -v jq >/dev/null 2>&1; then command jq "$@"
   else docker run --rm -i ghcr.io/jqlang/jq:latest "$@"; fi
 }
@@ -168,6 +217,8 @@ prep_mount() {
     umount -l "$MOUNT_HOST" 2>/dev/null || fusermount -uz "$MOUNT_HOST" 2>/dev/null || true
   fi
   mkdir -p "$MOUNT_HOST"
+  # Debian/Ubuntu: systemd macht / bereits "shared" – kein Bind-Mount nötig
+  [[ $PLATFORM == unraid ]] || return 0
   # Ohne "shared" kommt der Mount aus dem rclone-Container nicht auf dem Host an
   if ! mountpoint -q "$MOUNT_HOST" \
      || ! findmnt -no PROPAGATION --target "$MOUNT_HOST" 2>/dev/null | head -1 | grep -q shared; then
@@ -316,8 +367,107 @@ EOF
 # ---- rclone über das Unraid-Plugin ------------------------------------------
 # Das Plugin installiert das echte Binary als /usr/sbin/rcloneorig und einen
 # Wrapper /usr/sbin/rclone, der immer --config $RCLONE_PLG_CONF setzt.
-RCLONE_BIN=/usr/sbin/rcloneorig
-prclone() { "$RCLONE_BIN" --config "$RCLONE_PLG_CONF" "$@"; }
+prclone() { "$RCLONE_BIN" --config "$RCLONE_CONF" "$@"; }
+
+# ---- Debian/Ubuntu: Pakete, Docker, rclone, NVIDIA-Toolkit ---------------------
+apt_install() {  # nur fehlende Pakete installieren
+  local missing=() p
+  for p in "$@"; do dpkg -s "$p" >/dev/null 2>&1 || missing+=("$p"); done
+  (( ${#missing[@]} )) || return 0
+  log "Installiere Pakete: ${missing[*]}"
+  DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${missing[@]}" >/dev/null
+}
+
+ensure_docker_debian() {
+  if ! command -v docker >/dev/null 2>&1; then
+    [[ $INSTALL_DOCKER == true ]] || die "Docker fehlt (INSTALL_DOCKER=false) – bitte selbst installieren."
+    log "Installiere Docker aus dem offiziellen Repository"
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    local distro=debian codename=${VERSION_CODENAME:-}
+    if [[ $ID == ubuntu || ${ID_LIKE:-} == *ubuntu* ]]; then distro=ubuntu; codename=${UBUNTU_CODENAME:-$codename}; fi
+    [[ -n $codename ]] || die "Distribution nicht erkannt (VERSION_CODENAME fehlt)."
+    apt_install ca-certificates curl gnupg
+    install -m 0755 -d /etc/apt/keyrings
+    curl -fsSL "https://download.docker.com/linux/$distro/gpg" -o /etc/apt/keyrings/docker.asc
+    chmod a+r /etc/apt/keyrings/docker.asc
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/$distro $codename stable" \
+      > /etc/apt/sources.list.d/docker.list
+    DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq docker-ce docker-ce-cli containerd.io \
+      docker-buildx-plugin docker-compose-plugin >/dev/null
+  fi
+  systemctl enable --now docker >/dev/null 2>&1 || true
+  docker info >/dev/null 2>&1 || die "Docker läuft nicht – systemctl status docker"
+  log "  $(docker --version)"
+}
+
+# rclone vom Host (aktuelle Version von rclone.org, Paket nur als Fallback)
+ensure_rclone_host() {
+  [[ -x $RCLONE_BIN ]] && return 0
+  local arch tmp; arch=$(dpkg --print-architecture)
+  log "Installiere rclone"
+  if [[ $arch == amd64 || $arch == arm64 ]]; then
+    tmp=$(mktemp --suffix=.deb)
+    if curl -fsSL "https://downloads.rclone.org/rclone-current-linux-$arch.deb" -o "$tmp" \
+       && dpkg -i "$tmp" >/dev/null; then rm -f "$tmp"; return 0; fi
+    rm -f "$tmp"
+  fi
+  apt_install rclone
+  [[ -x $RCLONE_BIN ]]
+}
+
+# NVIDIA: Treiber muss installiert sein; dann Container Toolkit + Docker-Runtime
+ensure_nvidia_toolkit() {
+  [[ $JELLYFIN_HWACCEL == auto || $JELLYFIN_HWACCEL == nvenc ]] || return 0
+  command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1 || return 0
+  docker info --format '{{json .Runtimes}}' 2>/dev/null | grep -q nvidia && return 0
+  log "NVIDIA-GPU erkannt – installiere NVIDIA Container Toolkit"
+  apt_install ca-certificates curl gnupg
+  curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \
+    | gpg --dearmor --yes -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+  curl -fsSL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list \
+    | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \
+    > /etc/apt/sources.list.d/nvidia-container-toolkit.list
+  DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nvidia-container-toolkit >/dev/null
+  nvidia-ctk runtime configure --runtime=docker >/dev/null
+  systemctl restart docker
+  docker info >/dev/null 2>&1 || die "Docker startet nach NVIDIA-Konfiguration nicht – systemctl status docker"
+}
+
+# ---- Hardware-Beschleunigung für Jellyfin --------------------------------------
+# Setzt JF_HW_ARGS (docker run), JF_HW_TYPE (Jellyfin) und JF_HW_DEV (Gerät)
+detect_hwaccel() {
+  JF_HW_ARGS=(); JF_HW_TYPE=none; JF_HW_DEV=""
+  local want=$JELLYFIN_HWACCEL has_nv=0 vendor
+  [[ $want == none ]] && return 0
+  command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1 && has_nv=1
+  if [[ $want == nvenc || ( $want == auto && $has_nv == 1 ) ]]; then
+    if docker info --format '{{json .Runtimes}}' 2>/dev/null | grep -q nvidia; then
+      JF_HW_TYPE=nvenc
+      JF_HW_ARGS=(--runtime=nvidia -e NVIDIA_VISIBLE_DEVICES=all -e NVIDIA_DRIVER_CAPABILITIES=all)
+      return 0
+    fi
+    if [[ $PLATFORM == unraid ]]; then
+      warn "NVIDIA-GPU ohne Docker-Runtime – bitte das Plugin \"Nvidia Driver\" (Community Apps) installieren."
+    else
+      warn "NVIDIA-GPU ohne Docker-Runtime – NVIDIA Container Toolkit fehlt."
+    fi
+    [[ $want == nvenc ]] && return 0
+  fi
+  if [[ -e /dev/dri/renderD128 ]]; then
+    vendor=$(cat /sys/class/drm/renderD128/device/vendor 2>/dev/null || true)
+    JF_HW_ARGS=(--device /dev/dri); JF_HW_DEV=/dev/dri/renderD128
+    case $want in
+      qsv|vaapi) JF_HW_TYPE=$want ;;
+      *) if [[ $vendor == 0x8086 ]]; then JF_HW_TYPE=qsv; else JF_HW_TYPE=vaapi; fi ;;
+    esac
+    # Intel: OpenCL für HDR-Tonemapping (linuxserver-Mod)
+    [[ $JF_HW_TYPE == qsv ]] && JF_HW_ARGS+=(-e DOCKER_MODS=linuxserver/mods:jellyfin-opencl-intel)
+  fi
+}
 
 ensure_rclone_plugin() {
   [[ -x $RCLONE_BIN ]] && return 0
@@ -349,6 +499,10 @@ host_healthy() { host_mounted && timeout 15 ls -A "$MOUNT_HOST" 2>/dev/null | gr
 # Danach alle (ggf. gestapelten) FUSE-Mounts am Pfad entfernen.
 host_unmount() {
   local pat="rcloneorig .*mount $RCLONE_REMOTE: $MOUNT_HOST" i
+  if [[ $RCLONE_MODE == systemd ]]; then
+    systemctl stop mediastack-mount.service >/dev/null 2>&1 || true
+    pat="rclone mount $RCLONE_REMOTE: $MOUNT_HOST"
+  fi
   if pgrep -f "$pat" >/dev/null 2>&1; then
     pkill -TERM -f "$pat" 2>/dev/null || true
     for i in $(seq 1 30); do pgrep -f "$pat" >/dev/null 2>&1 || break; sleep 1; done
@@ -362,8 +516,48 @@ host_unmount() {
   done
 }
 
+# Debian/Ubuntu: Mount als systemd-Dienst. Startet nach Docker, wartet bis
+# InfiniDysk antwortet (bis 15 Min.) und startet rclone bei Fehlern neu.
+MOUNT_UNIT=/etc/systemd/system/mediastack-mount.service
+systemd_mount() {
+  build_rclone_flags
+  mkdir -p "$APPDATA/rclone-nzbdav/cache" "$STATE_DIR" "$MOUNT_HOST"
+  local tmp i; tmp=$(mktemp)
+  cat > "$tmp" <<EOF
+[Unit]
+Description=mediastack: rclone-Mount InfiniDysk-WebDAV ($MOUNT_HOST)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=notify
+ExecStartPre=/bin/mkdir -p $MOUNT_HOST
+ExecStartPre=/bin/bash -c 'for i in \$\$(seq 1 180); do curl -s -o /dev/null -m 5 -X PROPFIND ${DAV_URL:-http://$SERVER_IP:$P_INFINIDYSK/} && exit 0; sleep 5; done; exit 1'
+ExecStart=$RCLONE_BIN mount $RCLONE_REMOTE: $MOUNT_HOST --config $RCLONE_CONF ${RCLONE_FLAGS[*]} --cache-dir $APPDATA/rclone-nzbdav/cache --log-file $STATE_DIR/rclone.log --log-level NOTICE
+ExecStop=/usr/bin/fusermount3 -uz $MOUNT_HOST
+Restart=always
+RestartSec=15
+TimeoutStartSec=1200
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  if ! cmp -s "$tmp" "$MOUNT_UNIT" || ! host_healthy; then
+    install -m 644 "$tmp" "$MOUNT_UNIT"
+    systemctl daemon-reload
+    systemctl enable mediastack-mount.service >/dev/null 2>&1 || true
+    MOUNT_FIXED=1
+    systemctl restart mediastack-mount.service || { rm -f "$tmp"; return 1; }
+  fi
+  rm -f "$tmp"
+  for i in $(seq 1 20); do host_healthy && return 0; sleep 3; done
+  return 1
+}
+
 # Mount mit dem Plugin-rclone als Daemon direkt auf dem Host
 host_mount() {
+  [[ $RCLONE_MODE == systemd ]] && { systemd_mount; return; }
   build_rclone_flags
   # Fingerabdruck aus URL + Flags: geänderte Einstellungen -> neu mounten
   local sig; sig=$(printf '%s ' "${DAV_URL:-}" "${RCLONE_FLAGS[@]}" | md5sum | cut -c1-12)
@@ -448,6 +642,11 @@ EOF
 
 # Status der Neustart-Absicherung (für doctor)
 boot_status_ok() {
+  if [[ $PLATFORM != unraid ]]; then
+    if host_mode; then systemctl is-enabled -q mediastack-mount.service 2>/dev/null || return 1; fi
+    if [[ $WATCHDOG_ENABLED == true ]]; then systemctl is-active -q mediastack-watchdog.timer 2>/dev/null || return 1; fi
+    return 0
+  fi
   [[ -x $HOOK_DST && -x $HOOK2_DST && -f $BOOT_SRC ]] || return 1
   grep -q '# >>> mediastack v5' /boot/config/go 2>/dev/null || return 1
   if [[ $WATCHDOG_ENABLED == true ]]; then grep -qF "$(basename "$SELF") watchdog" /etc/cron.d/root 2>/dev/null || return 1; fi
@@ -460,7 +659,41 @@ boot_status_ok() {
 # der immer eingelesen wird.
 CRON_FILE=/boot/config/plugins/dynamix/mediastack.cron
 CRON_OLD=/boot/config/plugins/mediastack/mediastack.cron
+WD_SERVICE=/etc/systemd/system/mediastack-watchdog.service
+WD_TIMER=/etc/systemd/system/mediastack-watchdog.timer
+install_watchdog_systemd() {
+  if [[ $WATCHDOG_ENABLED == true ]]; then
+    cat > "$WD_SERVICE" <<EOF
+[Unit]
+Description=mediastack: rclone-Mount prüfen und reparieren
+After=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash $SELF watchdog
+EOF
+    cat > "$WD_TIMER" <<EOF
+[Unit]
+Description=mediastack: Watchdog alle 5 Minuten
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+
+[Install]
+WantedBy=timers.target
+EOF
+    systemctl daemon-reload
+    systemctl enable --now mediastack-watchdog.timer >/dev/null 2>&1 || true
+    log "Watchdog aktiv (systemd-Timer alle 5 Min., Log: $LOGHINT)"
+  else
+    systemctl disable --now mediastack-watchdog.timer >/dev/null 2>&1 || true
+    rm -f "$WD_SERVICE" "$WD_TIMER"; systemctl daemon-reload
+  fi
+}
+
 install_watchdog() {
+  [[ $PLATFORM == unraid ]] || { install_watchdog_systemd; return; }
   rm -f "$CRON_OLD"
   mkdir -p "$(dirname "$CRON_FILE")"
   if [[ $WATCHDOG_ENABLED == true ]]; then
@@ -468,7 +701,7 @@ install_watchdog() {
       echo "# mediastack: rclone-Mount alle 5 Minuten prüfen und reparieren"
       printf '*/5 * * * * [ -f %q ] && bash %q watchdog >/dev/null 2>&1\n' "$SELF" "$SELF"
     } > "$CRON_FILE"
-    log "Watchdog aktiv (alle 5 Min., Log: grep mediastack /var/log/syslog)"
+    log "Watchdog aktiv (alle 5 Min., Log: $LOGHINT)"
   else
     rm -f "$CRON_FILE"
   fi
@@ -514,17 +747,18 @@ check_chain() {
     bad "rclone nutzt $(conf_url), erwartet $DAV_URL"
     FIX=fix_rewrite_conf; FIX_DESC="rclone auf $DAV_URL umstellen und neu mounten"; return 1; fi
 
-  if [[ $RCLONE_MODE == plugin ]]; then
+  if host_mode; then
+    local what="rclone-Plugin"; [[ $RCLONE_MODE == systemd ]] && what="rclone"
     if exists rclone-nzbdav; then
-      bad "Alter Container rclone-nzbdav läuft parallel zum Plugin"
-      FIX=fix_remove_rclone_ct; FIX_DESC="Container rclone-nzbdav entfernen und per Plugin mounten"; return 1; fi
+      bad "Alter Container rclone-nzbdav läuft parallel zu $what"
+      FIX=fix_remove_rclone_ct; FIX_DESC="Container rclone-nzbdav entfernen und per $what mounten"; return 1; fi
     if [[ ! -x $RCLONE_BIN ]]; then
-      bad "rclone-Plugin nicht installiert"
-      FIX=fix_install_plugin; FIX_DESC="rclone-Plugin aus den Community Apps installieren"; return 1; fi
-    ok "rclone-Plugin installiert ($("$RCLONE_BIN" version 2>/dev/null | head -1))"
-    if ! timeout 30 "$RCLONE_BIN" --config "$RCLONE_PLG_CONF" lsd "$RCLONE_REMOTE:" >/dev/null 2>&1; then
+      bad "$what nicht installiert"
+      FIX=fix_install_plugin; FIX_DESC="$what installieren"; return 1; fi
+    ok "$what installiert ($("$RCLONE_BIN" version 2>/dev/null | head -1))"
+    if ! timeout 30 "$RCLONE_BIN" --config "$RCLONE_CONF" lsd "$RCLONE_REMOTE:" >/dev/null 2>&1; then
       bad "Remote '$RCLONE_REMOTE:' erreicht das WebDAV nicht"
-      FIX=fix_rewrite_conf; FIX_DESC="Remote '$RCLONE_REMOTE' in der Plugin-Konfiguration neu schreiben und neu mounten"; return 1; fi
+      FIX=fix_rewrite_conf; FIX_DESC="Remote '$RCLONE_REMOTE' neu schreiben und neu mounten"; return 1; fi
     ok "Remote '$RCLONE_REMOTE:' erreicht das WebDAV"
     if ! host_mounted; then
       bad "rclone-Mount unter $MOUNT_HOST läuft nicht"
@@ -598,10 +832,14 @@ fix_host_mount() {
   sleep 2
   fix_restart_apps radarr sonarr jellyfin
 }
-fix_mount() { if [[ $RCLONE_MODE == plugin ]]; then fix_host_mount; else fix_propagation; fi; }
+fix_mount() { if host_mode; then fix_host_mount; else fix_propagation; fi; }
 write_conf() { if [[ $RCLONE_MODE == plugin ]]; then write_plugin_remote; else write_rclone_conf; fi; }
 fix_rewrite_conf() { write_conf && fix_mount; }
-fix_install_plugin() { (( DOC_QUIET )) && return 1; ensure_rclone_plugin && write_plugin_remote && fix_host_mount; }
+fix_install_plugin() {
+  (( DOC_QUIET )) && return 1
+  if [[ $RCLONE_MODE == systemd ]]; then ensure_rclone_host && write_rclone_conf && fix_host_mount
+  else ensure_rclone_plugin && write_plugin_remote && fix_host_mount; fi
+}
 fix_remove_rclone_ct() { remove_ct rclone-nzbdav && fix_host_mount; }
 fix_new_creds() {
   (( DOC_QUIET )) && return 1
@@ -625,8 +863,10 @@ run_doctor() {
         else
           bad "Neustart-Absicherung unvollständig (Hooks/go-Eintrag/Watchdog-Cron)"
           if ask "Hooks, go-Eintrag und Watchdog-Cron neu einrichten"; then
-            install_boot_hooks; install_watchdog
-            boot_status_ok && ok "Neustart-Absicherung eingerichtet" || bad "Weiterhin unvollständig – grep mediastack /etc/cron.d/root /boot/config/go"
+            if [[ $PLATFORM == unraid ]]; then install_boot_hooks
+            elif host_mode; then systemctl enable mediastack-mount.service >/dev/null 2>&1 || true; fi
+            install_watchdog
+            boot_status_ok && ok "Neustart-Absicherung eingerichtet" || bad "Weiterhin unvollständig"
           fi
         fi
       fi
@@ -687,7 +927,11 @@ case "$CMD" in
     run_doctor; exit $? ;;
   remove)
     rm -f "$CRON_FILE" "$CRON_OLD"; /usr/local/sbin/update_cron >/dev/null 2>&1 || true
-    [[ $RCLONE_MODE == plugin ]] && host_unmount && log "rclone-Mount $MOUNT_HOST ausgehängt (Plugin bleibt installiert)"
+    host_mode && host_unmount && log "rclone-Mount $MOUNT_HOST ausgehängt (rclone bleibt installiert)"
+    if [[ $PLATFORM != unraid ]]; then
+      systemctl disable --now mediastack-mount.service mediastack-watchdog.timer >/dev/null 2>&1 || true
+      rm -f "$MOUNT_UNIT" "$WD_SERVICE" "$WD_TIMER"; systemctl daemon-reload 2>/dev/null || true
+    fi
     for c in "${CONTAINERS[@]}"; do exists "$c" && remove_ct "$c" && log "$c entfernt"; done
     log "Configs in $APPDATA und Medien in $DATA wurden NICHT gelöscht."; exit 0 ;;
   self-update)
@@ -714,10 +958,21 @@ case "$CMD" in
 esac
 
 # ------------------------------- 0. Prüfungen --------------------------------
-[[ $EUID -eq 0 ]] || die "Bitte als root ausführen."
-[[ -f /etc/unraid-version ]] || warn "Kein Unraid erkannt – fahre trotzdem fort."
-docker info >/dev/null 2>&1 || die "Docker läuft nicht (Array gestartet? Docker aktiviert?)."
-[[ -d /mnt/user ]] || die "/mnt/user fehlt – ist das Array gestartet?"
+[[ $EUID -eq 0 ]] || die "Bitte als root ausführen (z. B. sudo bash $SELF_NAME)."
+case $PLATFORM in
+  unraid)
+    log "Plattform: Unraid $(cat /etc/unraid-version 2>/dev/null | sed -n 's/version="\(.*\)"/\1/p')"
+    docker info >/dev/null 2>&1 || die "Docker läuft nicht (Array gestartet? Docker aktiviert?)."
+    [[ -d /mnt/user ]] || die "/mnt/user fehlt – ist das Array gestartet?" ;;
+  debian)
+    log "Plattform: $(. /etc/os-release; echo "${PRETTY_NAME:-Debian/Ubuntu}")"
+    command -v systemctl >/dev/null 2>&1 || die "systemd wird benötigt."
+    apt_install curl jq fuse3 ca-certificates gnupg procps util-linux
+    ensure_docker_debian
+    ensure_nvidia_toolkit ;;
+  *) die "Plattform nicht unterstützt (nur Unraid und Debian/Ubuntu). Erzwingen: PLATFORM=unraid|debian" ;;
+esac
+log "Pfade: Configs $APPDATA · Medien $DATA/media · Mount $MOUNT_HOST · Benutzer $PUID:$PGID"
 [[ -e /dev/fuse ]] || die "/dev/fuse fehlt – rclone-Mount nicht möglich."
 
 [[ -n $SERVER_IP ]] || SERVER_IP=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')
@@ -757,7 +1012,7 @@ chown -R 1000:1000 "$APPDATA/seerr"     # Seerr läuft als UID 1000
 # Damit der rclone-Mount aus dem Container auf dem Host und in den anderen
 # Containern sichtbar wird, muss der Mountpunkt "shared" sein.
 prep_mount
-install_boot_hooks
+[[ $PLATFORM == unraid ]] && install_boot_hooks
 
 # ------------------------------- 3. *arr API-Keys vorbelegen -----------------
 seed_arr() {  # name port -> setzt Variable KEY_<NAME>
@@ -846,13 +1101,19 @@ code=$(curl -s -o /dev/null -w '%{http_code}' -u "$WEBDAV_USER:$WEBDAV_PASS" -X 
 
 # ------------------------------- 5. rclone-Mount -----------------------------
 RC_DIR="$APPDATA/rclone-nzbdav"
-if [[ $RCLONE_MODE == plugin ]]; then
-  log "rclone über das Unraid-Plugin"
-  if exists rclone-nzbdav; then log "Entferne Container rclone-nzbdav (Plugin-Modus)"; remove_ct rclone-nzbdav; fi
-  ensure_rclone_plugin || die "rclone-Plugin konnte nicht installiert werden – Log: /tmp/mediastack-plugin.log"
+if host_mode; then
+  if exists rclone-nzbdav; then log "Entferne Container rclone-nzbdav ($RCLONE_MODE-Modus)"; remove_ct rclone-nzbdav; fi
+  if [[ $RCLONE_MODE == plugin ]]; then
+    log "rclone über das Unraid-Plugin"
+    ensure_rclone_plugin || die "rclone-Plugin konnte nicht installiert werden – Log: /tmp/mediastack-plugin.log"
+    write_plugin_remote
+  else
+    log "rclone als systemd-Dienst (mediastack-mount.service)"
+    ensure_rclone_host || die "rclone konnte nicht installiert werden"
+    write_rclone_conf
+  fi
   log "  $("$RCLONE_BIN" version | head -1)"
-  write_plugin_remote
-  log "  Remote '$RCLONE_REMOTE' in $RCLONE_PLG_CONF eingetragen"
+  log "  Remote '$RCLONE_REMOTE' in $RCLONE_CONF eingetragen"
   printf '    hänge %s ein ' "$MOUNT_HOST"
   if host_mount; then echo " ok"
   else
@@ -918,9 +1179,10 @@ for app in radarr sonarr; do
     "${!img_var}"
 done
 
-JF_GPU=(); [[ -e /dev/dri ]] && JF_GPU=(--device /dev/dri)
+detect_hwaccel
+log "Jellyfin Hardware-Beschleunigung: $JF_HW_TYPE${JF_HW_DEV:+ ($JF_HW_DEV)}"
 run_ct jellyfin $P_JELLYFIN "$ICON/jellyfin.png" -- \
-  "${LSIO_ENV[@]}" "${JF_GPU[@]}" -p $P_JELLYFIN:8096 \
+  "${LSIO_ENV[@]}" "${JF_HW_ARGS[@]}" -p $P_JELLYFIN:8096 \
   -v "$APPDATA/jellyfin:/config" \
   -v "$DATA/media:/data/media" \
   -v "$MOUNT_HOST:$MOUNT_CT:rslave" \
@@ -1164,6 +1426,28 @@ if [[ $RECYCLARR_ENABLED == true ]]; then
 fi
 
 # ------------------------------- 8. Jellyfin ---------------------------------
+# HW-Beschleunigung in Jellyfin eintragen (Dashboard → Wiedergabe → Transcoding).
+# Eine vorhandene Einstellung bleibt, außer JELLYFIN_HWACCEL_FORCE=true.
+jf_set_hwaccel() {
+  [[ $JF_HW_TYPE == none ]] && return 0
+  local enc cur
+  enc=$(jfc GET /System/Configuration/encoding) || return 1
+  cur=$(jq -r '.HardwareAccelerationType // "none"' <<<"$enc")
+  if [[ ${cur,,} != none && $JELLYFIN_HWACCEL_FORCE != true ]]; then
+    log "  Hardware-Beschleunigung bereits eingestellt ($cur) – unverändert"; return 0
+  fi
+  enc=$(jq -c --arg t "$JF_HW_TYPE" --arg d "$JF_HW_DEV" '
+    .HardwareAccelerationType = $t
+    | .EnableHardwareEncoding = true
+    | .HardwareDecodingCodecs = ["h264","hevc","mpeg2video","vc1","vp9"]
+    | .EnableDecodingColorDepth10Hevc = true
+    | .EnableDecodingColorDepth10Vp9 = true
+    | (if $d != "" then .VaapiDevice = $d | .QsvDevice = $d else . end)
+    | (if $t == "qsv" or $t == "nvenc" then .EnableTonemapping = true else . end)' <<<"$enc")
+  jfc POST /System/Configuration/encoding "$enc" >/dev/null || return 1
+  log "  Hardware-Beschleunigung: $JF_HW_TYPE${JF_HW_DEV:+ ($JF_HW_DEV)}"
+}
+
 log "Konfiguriere Jellyfin"
 wait_http "$JF/health"
 JF_AUTH='MediaBrowser Client="mediastack", Device="setup", DeviceId="mediastack-setup", Version="1.0"'
@@ -1197,6 +1481,7 @@ if [[ -n $JF_TOKEN && $JF_TOKEN != null ]]; then
   }
   add_lib Filme  movies  /data/media/movies
   add_lib Serien tvshows /data/media/tv
+  jf_set_hwaccel || warn "  Hardware-Beschleunigung konnte nicht gesetzt werden – Dashboard → Wiedergabe → Transcoding"
 
   JF_KEY=$(jfc GET /Auth/Keys | jq -r '[.Items[] | select(.AppName=="mediastack")][0].AccessToken // empty')
   if [[ -z $JF_KEY ]]; then
