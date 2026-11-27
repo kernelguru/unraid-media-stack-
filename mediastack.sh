@@ -20,7 +20,7 @@
 #  "mediastack.conf" neben das Script legen (wird automatisch geladen).
 # =============================================================================
 set -Eeuo pipefail
-SCRIPT_VERSION="2.0.0"
+SCRIPT_VERSION="2.1.0"
 REPO_RAW="https://raw.githubusercontent.com/kernelguru/unraid-media-stack-/main"
 
 # ------------------------------- KONFIGURATION -------------------------------
@@ -56,6 +56,16 @@ JELLYFIN_HWACCEL_FORCE=false         # true = auch eine vorhandene Jellyfin-Eins
 ADMIN_USER="admin"                   # Login für Radarr/Sonarr/Prowlarr/Jellyfin/Seerr
 ADMIN_PASS=""                        # leer = wird abgefragt
 ADMIN_EMAIL="admin@mediastack.local" # nur für Seerr
+
+# Radarr/Sonarr/Prowlarr: im LAN ohne Login. Neuere Versionen verlangen dafür
+# "Allowed Hosts" = die Adressen, unter denen du die Apps aufrufst (Host-Header,
+# keine Client-IPs, kein CIDR). Automatisch: Server-IP, Hostname, Hostname.local,
+# localhost, 127.0.0.1. Eigene zusätzlich, kommagetrennt, z. B. Proxy-Domains:
+#   ARR_ALLOWED_HOSTS="radarr.example.com,*.example.com"
+ARR_ALLOWED_HOSTS=""
+
+# Dashboard: kleine Webseite mit Links, API-Keys (verdeckt) und Status
+DASHBOARD_ENABLED=true
 
 LANG_CODE="de"                       # Jellyfin-UI/Metadaten
 COUNTRY_CODE="DE"
@@ -95,9 +105,10 @@ IMG_SONARR="lscr.io/linuxserver/sonarr:latest"
 IMG_JELLYFIN="lscr.io/linuxserver/jellyfin:latest"
 IMG_SEERR="ghcr.io/seerr-team/seerr:latest"
 IMG_RECYCLARR="ghcr.io/recyclarr/recyclarr:8"    # "latest" wird nicht mehr gepflegt
+IMG_DASHBOARD="nginx:alpine"
 
 # Ports
-P_INFINIDYSK=3000; P_PROWLARR=9696; P_RADARR=7878
+P_INFINIDYSK=3000; P_PROWLARR=9696; P_RADARR=7878; P_DASHBOARD=8090
 P_SONARR=8989;     P_JELLYFIN=8096; P_SEERR=5055
 
 # TRaSH-Guides per Recyclarr (Qualitätsprofile + Custom Formats)
@@ -175,7 +186,7 @@ host_mode() { [[ $RCLONE_MODE == plugin || $RCLONE_MODE == systemd ]]; }
 
 STATE_DIR="$APPDATA/mediastack"
 SECRETS="$STATE_DIR/secrets.env"
-CONTAINERS=(seerr jellyfin recyclarr sonarr radarr prowlarr rclone-nzbdav infinidysk)
+CONTAINERS=(dashboard seerr jellyfin recyclarr sonarr radarr prowlarr rclone-nzbdav infinidysk)
 
 # ------------------------------- Hilfsfunktionen -----------------------------
 c_g=$'\e[32m'; c_y=$'\e[33m'; c_r=$'\e[31m'; c_b=$'\e[1m'; c_0=$'\e[0m'
@@ -303,6 +314,168 @@ run_ct() {  # name webui-port icon-url -- docker-args...
 }
 
 ICON="https://cdn.jsdelivr.net/gh/selfhst/icons/png"
+
+# ---- Allowed Hosts für Radarr/Sonarr/Prowlarr ------------------------------------
+arr_allowed_hosts() {
+  local h=("$SERVER_IP" localhost 127.0.0.1) hn extra
+  hn=$(hostname -s 2>/dev/null || hostname 2>/dev/null || true)
+  [[ -n $hn ]] && h+=("$hn" "$hn.local")
+  IFS=',; ' read -r -a extra <<<"$ARR_ALLOWED_HOSTS"
+  h+=("${extra[@]}")
+  printf '%s\n' "${h[@]}" | awk 'NF && !seen[tolower($0)]++' | paste -sd, -
+}
+
+# ---- Dashboard ------------------------------------------------------------------
+DASH_DIR="$STATE_DIR/dashboard"
+
+# Mount-Status für das Dashboard (von doctor/watchdog/Installation geschrieben)
+write_mount_status() {  # rc [detail]
+  [[ $DASHBOARD_ENABLED == true && -d $DASH_DIR ]] || return 0
+  jq -n --arg ok "$([[ $1 == 0 ]] && echo true || echo false)" --arg d "${2:-}" \
+        --arg t "$(date -Iseconds)" --arg m "$MOUNT_HOST" \
+     '{mount_ok: ($ok == "true"), detail: $d, checked: $t, path: $m}' > "$DASH_DIR/status.json.tmp" \
+  && mv -f "$DASH_DIR/status.json.tmp" "$DASH_DIR/status.json"
+}
+
+write_dashboard() {
+  mkdir -p "$DASH_DIR"
+  local seerr_key=""
+  [[ -f $APPDATA/seerr/settings.json ]] && seerr_key=$(jq -r '.main.apiKey // empty' "$APPDATA/seerr/settings.json" 2>/dev/null || true)
+  jq -n --arg ip "$SERVER_IP" --arg v "$SCRIPT_VERSION" --arg t "$(date '+%d.%m.%Y %H:%M')" \
+        --arg icon "$ICON" --arg plat "$PLATFORM" \
+        --arg pse "$P_SEERR" --arg pjf "$P_JELLYFIN" --arg pra "$P_RADARR" \
+        --arg pso "$P_SONARR" --arg ppr "$P_PROWLARR" --arg pnd "$P_INFINIDYSK" \
+        --arg kse "$seerr_key" --arg kjf "${JF_KEY:-}" --arg kra "${KEY_RADARR:-}" \
+        --arg kso "${KEY_SONARR:-}" --arg kpr "${KEY_PROWLARR:-}" --arg knd "${NZBDAV_API_KEY:-}" '
+    def app(n; d; p; ping; ic; k): {name:n, desc:d, url:"http://\($ip):\(p)/", ping:"http://\($ip):\(p)\(ping)", icon:"\($icon)/\(ic).png", key:k};
+    {generated:$t, version:$v, platform:$plat, apps:[
+      app("Seerr";      "Filme & Serien anfragen";     $pse; "/api/v1/status"; "seerr";     $kse),
+      app("Jellyfin";   "Mediaserver";                 $pjf; "/health";        "jellyfin";  $kjf),
+      app("Radarr";     "Filme";                       $pra; "/ping";          "radarr";    $kra),
+      app("Sonarr";     "Serien";                      $pso; "/ping";          "sonarr";    $kso),
+      app("Prowlarr";   "Indexer";                     $ppr; "/ping";          "prowlarr";  $kpr),
+      app("InfiniDysk"; "Usenet-Streaming";          $pnd; "/";              "nzbget";    $knd)
+    ]}' > "$DASH_DIR/apps.json"
+  chmod 644 "$DASH_DIR/apps.json"
+
+  cat > "$DASH_DIR/index.html" <<'HTML'
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Media-Stack</title>
+<style>
+  :root { --bg:#f4f5f7; --card:#fff; --text:#1d2129; --muted:#6b7280; --line:#e5e7eb;
+          --ok:#16a34a; --bad:#dc2626; --wait:#9ca3af; --accent:#2563eb; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#0f1115; --card:#181b21; --text:#e5e7eb; --muted:#9ca3af; --line:#262a33; --accent:#60a5fa; }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; font:15px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; background:var(--bg); color:var(--text); }
+  main { max-width:960px; margin:0 auto; padding:24px 16px 40px; }
+  header { display:flex; align-items:baseline; justify-content:space-between; gap:12px; flex-wrap:wrap; margin-bottom:16px; }
+  h1 { font-size:22px; margin:0; }
+  .meta { color:var(--muted); font-size:13px; }
+  .mount { display:flex; align-items:center; gap:10px; background:var(--card); border:1px solid var(--line);
+           border-radius:12px; padding:12px 14px; margin-bottom:16px; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(280px,1fr)); gap:14px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:14px; display:flex; flex-direction:column; gap:10px; }
+  .top { display:flex; align-items:center; gap:12px; }
+  .top img { width:40px; height:40px; border-radius:8px; object-fit:contain; }
+  .name { font-weight:600; font-size:16px; }
+  .desc { color:var(--muted); font-size:13px; }
+  .dot { width:10px; height:10px; border-radius:50%; background:var(--wait); flex:none; margin-left:auto; }
+  .dot.ok { background:var(--ok); } .dot.bad { background:var(--bad); }
+  .mount .dot { margin-left:0; }
+  a.open { color:var(--accent); text-decoration:none; font-size:14px; word-break:break-all; }
+  a.open:hover { text-decoration:underline; }
+  .key { display:flex; align-items:center; gap:6px; border-top:1px solid var(--line); padding-top:10px; }
+  .key code { flex:1; font:13px ui-monospace,SFMono-Regular,Menlo,monospace; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .key .label { color:var(--muted); font-size:12px; }
+  button { border:1px solid var(--line); background:transparent; color:var(--text); border-radius:8px; padding:4px 8px; font-size:13px; cursor:pointer; }
+  button:hover { border-color:var(--accent); }
+  footer { color:var(--muted); font-size:12px; margin-top:20px; text-align:center; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Media-Stack</h1>
+    <span class="meta" id="meta"></span>
+  </header>
+  <div class="mount"><span class="dot" id="mdot"></span><span id="mtext">rclone-Mount: Status wird geladen …</span></div>
+  <div class="grid" id="grid"></div>
+  <footer>Status der Apps wird jede Minute aktualisiert · Mount-Status aus der letzten Watchdog-Prüfung</footer>
+</main>
+<script>
+const MASK = '••••••••••••••••';
+const grid = document.getElementById('grid');
+
+function copyText(t) {
+  if (navigator.clipboard && window.isSecureContext) return navigator.clipboard.writeText(t);
+  const ta = document.createElement('textarea'); ta.value = t; ta.style.position = 'fixed'; ta.style.opacity = '0';
+  document.body.appendChild(ta); ta.select(); try { document.execCommand('copy'); } finally { ta.remove(); }
+  return Promise.resolve();
+}
+
+function card(a, i) {
+  const el = document.createElement('div'); el.className = 'card';
+  el.innerHTML = `
+    <div class="top"><img alt="" src="${a.icon}" onerror="this.style.visibility='hidden'">
+      <div><div class="name"></div><div class="desc"></div></div><span class="dot" id="d${i}" title="wird geprüft"></span></div>
+    <a class="open" target="_blank" rel="noopener"></a>`;
+  el.querySelector('.name').textContent = a.name;
+  el.querySelector('.desc').textContent = a.desc;
+  const link = el.querySelector('a.open'); link.href = a.url; link.textContent = a.url;
+  if (a.key) {
+    const k = document.createElement('div'); k.className = 'key';
+    k.innerHTML = '<span class="label">API-Key</span><code></code><button class="show" title="Anzeigen">👁</button><button class="copy">Kopieren</button>';
+    const code = k.querySelector('code'); code.textContent = MASK;
+    k.querySelector('.show').onclick = () => { code.textContent = code.textContent === MASK ? a.key : MASK; };
+    const cb = k.querySelector('.copy');
+    cb.onclick = () => copyText(a.key).then(() => { cb.textContent = 'Kopiert ✓'; setTimeout(() => cb.textContent = 'Kopieren', 1500); });
+    el.appendChild(k);
+  }
+  return el;
+}
+
+async function ping(url) {
+  const ctl = new AbortController(); const t = setTimeout(() => ctl.abort(), 5000);
+  try { await fetch(url, { mode: 'no-cors', cache: 'no-store', signal: ctl.signal }); return true; }
+  catch { return false; } finally { clearTimeout(t); }
+}
+
+async function refreshApps(apps) {
+  apps.forEach(async (a, i) => {
+    const d = document.getElementById('d' + i), up = await ping(a.ping);
+    d.className = 'dot ' + (up ? 'ok' : 'bad'); d.title = up ? 'online' : 'nicht erreichbar';
+  });
+}
+
+async function refreshMount() {
+  const dot = document.getElementById('mdot'), txt = document.getElementById('mtext');
+  try {
+    const s = await (await fetch('status.json', { cache: 'no-store' })).json();
+    const when = new Date(s.checked).toLocaleString('de-DE');
+    dot.className = 'dot ' + (s.mount_ok ? 'ok' : 'bad');
+    txt.textContent = s.mount_ok ? `rclone-Mount ${s.path}: in Ordnung · geprüft ${when}`
+                                 : `rclone-Mount ${s.path}: ${s.detail || 'Problem'} · geprüft ${when}`;
+  } catch { dot.className = 'dot'; txt.textContent = 'rclone-Mount: noch keine Prüfung vorhanden'; }
+}
+
+fetch('apps.json', { cache: 'no-store' }).then(r => r.json()).then(cfg => {
+  document.getElementById('meta').textContent = `mediastack ${cfg.version} · ${cfg.platform} · erzeugt ${cfg.generated}`;
+  cfg.apps.forEach((a, i) => grid.appendChild(card(a, i)));
+  refreshApps(cfg.apps); refreshMount();
+  setInterval(() => { refreshApps(cfg.apps); refreshMount(); }, 60000);
+});
+</script>
+</body>
+</html>
+HTML
+  chmod 644 "$DASH_DIR/index.html"
+}
 
 # ------------------------------- Mount-Diagnose / Reparatur ------------------
 detect_ip() {
@@ -712,7 +885,8 @@ DOC_AUTO=0    # 1 = ohne Rückfrage reparieren
 DOC_QUIET=0   # 1 = nur Syslog (Watchdog)
 dmsg() { if (( DOC_QUIET )); then logger -t mediastack "$*"; else echo "$*"; fi; }
 ok()   { (( DOC_QUIET )) || echo "  ${c_g}✔${c_0} $*"; }
-bad()  { if (( DOC_QUIET )); then logger -t mediastack "Problem: $*"; else echo "  ${c_r}✘${c_0} $*"; fi; }
+LAST_BAD=""
+bad()  { LAST_BAD="$*"; if (( DOC_QUIET )); then logger -t mediastack "Problem: $*"; else echo "  ${c_r}✘${c_0} $*"; fi; }
 ask()  { (( DOC_AUTO )) && return 0; local a; read -rp "    → $*? [J/n] " a; [[ -z $a || $a =~ ^[jJyY] ]]; }
 running() { [[ $(docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null) == true ]]; }
 has_content() { grep -q 'completed-symlinks' <<<"$1"; }
@@ -902,7 +1076,7 @@ case "$CMD" in
     [[ $EUID -eq 0 ]] || die "Bitte als root ausführen."
     [[ ${1:-} == -y || ${1:-} == --yes ]] && DOC_AUTO=1
     trap - ERR; set +e
-    run_doctor; exit $? ;;
+    run_doctor; rc=$?; write_mount_status "$rc" "$LAST_BAD"; exit $rc ;;
   watchdog)
     case "${1:-run}" in
       pause)  mkdir -p "$STATE_DIR"; touch "$STATE_DIR/watchdog.paused"; log "Watchdog pausiert"; exit 0 ;;
@@ -924,7 +1098,7 @@ case "$CMD" in
     exec 9>/var/run/mediastack-watchdog.lock
     flock -n 9 || exit 0                           # läuft schon
     DOC_AUTO=1; DOC_QUIET=1
-    run_doctor; exit $? ;;
+    run_doctor; rc=$?; write_mount_status "$rc" "$LAST_BAD"; exit $rc ;;
   remove)
     rm -f "$CRON_FILE" "$CRON_OLD"; /usr/local/sbin/update_cron >/dev/null 2>&1 || true
     host_mode && host_unmount && log "rclone-Mount $MOUNT_HOST ausgehängt (rclone bleibt installiert)"
@@ -1029,6 +1203,7 @@ seed_arr() {  # name port -> setzt Variable KEY_<NAME>
   <ApiKey>$key</ApiKey>
   <AuthenticationMethod>Forms</AuthenticationMethod>
   <AuthenticationRequired>DisabledForLocalAddresses</AuthenticationRequired>
+  <AllowedHosts>$(arr_allowed_hosts)</AllowedHosts>
   <LaunchBrowser>False</LaunchBrowser>
   <UpdateMechanism>Docker</UpdateMechanism>
   <InstanceName>${name^}</InstanceName>
@@ -1217,8 +1392,9 @@ arr_add() {
 
 set_auth() {  # key base
   local cfg; cfg=$(arr "$1" GET "$2/config/host") || return 1
-  cfg=$(jq -c --arg u "$ADMIN_USER" --arg p "$ADMIN_PASS" '
+  cfg=$(jq -c --arg u "$ADMIN_USER" --arg p "$ADMIN_PASS" --arg h "$(arr_allowed_hosts)" '
     .authenticationMethod="forms" | .authenticationRequired="disabledForLocalAddresses"
+    | .allowedHosts=$h
     | .username=$u | .password=$p | .passwordConfirmation=$p' <<<"$cfg")
   arr "$1" PUT "$2/config/host/$(jq -r .id <<<"$cfg")" "$cfg" >/dev/null
 }
@@ -1581,10 +1757,22 @@ rm -f "$JAR"
 
 install_watchdog
 
+# ------------------------------- 10. Dashboard -------------------------------
+if [[ $DASHBOARD_ENABLED == true ]]; then
+  log "Dashboard"
+  write_dashboard
+  if host_healthy 2>/dev/null; then write_mount_status 0; else write_mount_status 1 "Mount bei der Installation nicht sichtbar"; fi
+  run_ct dashboard "$P_DASHBOARD" "$ICON/homepage.png" -- \
+    -p "$P_DASHBOARD:80" -v "$DASH_DIR:/usr/share/nginx/html:ro" "$IMG_DASHBOARD"
+elif exists dashboard; then
+  remove_ct dashboard
+fi
+
 # ------------------------------- Fertig --------------------------------------
 cat <<EOF
 
 ${c_b}════════════ Media-Stack bereit ════════════${c_0}
+$([[ $DASHBOARD_ENABLED == true ]] && echo "  Dashboard   http://$SERVER_IP:$P_DASHBOARD   ← alle Links + API-Keys")
   Seerr       $SE        ← hier Filme/Serien anfragen
   Jellyfin    $JF
   Radarr      $RA

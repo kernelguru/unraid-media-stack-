@@ -24,6 +24,14 @@
 #ADMIN_PASS=""                       # leer = wird beim Start abgefragt
 #ADMIN_EMAIL="admin@mediastack.local"
 
+# Zusätzliche "Allowed Hosts" für Radarr/Sonarr/Prowlarr (Adressen, unter denen
+# du sie aufrufst – z. B. Reverse-Proxy-Domains). Server-IP/Hostname sind automatisch drin.
+#ARR_ALLOWED_HOSTS="radarr.example.com,*.example.com"
+
+# Dashboard mit Links, API-Keys und Status (ohne Login – nur im LAN!)
+#DASHBOARD_ENABLED=true
+#P_DASHBOARD=8090
+
 #LANG_CODE="de"
 #COUNTRY_CODE="DE"
 

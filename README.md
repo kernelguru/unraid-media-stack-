@@ -35,6 +35,19 @@ Es wird nichts heruntergeladen. Radarr und Sonarr importieren nur **Symlinks**, 
 - Root-Zugang (Unraid: SSH oder Web-Terminal · Debian/Ubuntu: `sudo`)
 - Freie Ports: 3000, 5055, 7878, 8096, 8989, 9696
 
+## Dashboard
+
+Unter `http://<server-ip>:8090` liegt eine kleine Übersichtsseite (Container `dashboard`, nginx):
+
+- Links zu Seerr, Jellyfin, Radarr, Sonarr, Prowlarr und InfiniDysk
+- **API-Keys** verdeckt, mit Knöpfen zum Einblenden (👁) und **Kopieren**
+- **Online-Status** je App (grün/rot), wird jede Minute aktualisiert
+- **rclone-Mount-Status** aus der letzten Prüfung von Watchdog bzw. `doctor`
+
+> Die Seite hat **keinen Login**. Jeder im LAN kann die API-Keys sehen. Port 8090 deshalb **nicht** ins Internet freigeben und auch nicht über einen Reverse Proxy veröffentlichen.
+
+Einstellungen: `DASHBOARD_ENABLED=true|false`, `P_DASHBOARD=8090`. Die Dateien liegen in `appdata/mediastack/dashboard/` (`index.html`, `apps.json`, `status.json`) und werden bei jedem Lauf des Scripts neu geschrieben.
+
 ## Plattformen
 
 Das Script erkennt die Plattform an `/etc/unraid-version` bzw. `/etc/os-release`. Erzwingen geht mit `PLATFORM=unraid|debian` in der `mediastack.conf`.
@@ -324,12 +337,14 @@ bash mediastack.sh recreate rclone-nzbdav prowlarr radarr sonarr jellyfin seerr
 - **Netzwerk:** Die Container sprechen über `http://<server-ip>:<port>` miteinander statt über ein eigenes Docker-Netz, denn Unraid löscht eigene Netze standardmäßig beim Neustart von Docker. Der Server sollte deshalb eine **feste IP** haben.
 - **Keine Unraid-Vorlagen:** Die Container werden per `docker run` angelegt. Starten, Stoppen, Logs und WebUI funktionieren im Docker-Tab, *Edit* aber nicht. Änderungen deshalb in `mediastack.conf` vornehmen und `bash mediastack.sh update` ausführen.
 - **Bestehende Container:** Gibt es schon einen Container mit gleichem Namen (z. B. `jellyfin`), wird er nicht angefasst. Die Jellyfin-Automatik funktioniert dann nur, wenn Benutzer und Passwort übereinstimmen.
+- **Login für Radarr, Sonarr und Prowlarr:** Im LAN gibt es keinen Login (*Disabled for Local Addresses*), von außen gilt Benutzer und Passwort. Neuere Versionen verlangen dafür *Allowed Hosts*, also die Adressen, unter denen du die Apps aufrufst. Es zählt der Hostname im Browser, nicht die IP des Clients, und CIDR geht nicht. Automatisch eingetragen werden Server-IP, Hostname, `Hostname.local`, `localhost` und `127.0.0.1`. Weitere Adressen, etwa die Domain eines Reverse Proxys, kommen kommagetrennt in `ARR_ALLOWED_HOSTS` (Platzhalter wie `*.example.com` gehen). Fehlt eine Adresse, antwortet die App dort mit „Invalid Hostname“.
 - **Sicherheit:** Die Apps sind ohne Reverse Proxy nur für das LAN gedacht. Für den Zugriff von außen bitte einen Reverse Proxy (z. B. Nginx Proxy Manager, SWAG) oder ein VPN (z. B. Tailscale, WireGuard) verwenden.
 
 ## Fehlersuche
 
 | Problem | Lösung |
 |---|---|
+| `Invalid Hostname` beim Aufruf von Radarr/Sonarr/Prowlarr | Adresse fehlt in *Allowed Hosts* → in `ARR_ALLOWED_HOSTS` ergänzen, dann `bash mediastack.sh` ausführen |
 | `Port … ist belegt` | Port in `mediastack.conf` ändern oder den anderen Container stoppen |
 | Mount leer / nicht sichtbar | `bash mediastack.sh doctor` |
 | WebDAV liefert nicht 207 | `bash mediastack.sh doctor` → Zugangsdaten neu eingeben |
