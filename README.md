@@ -82,11 +82,8 @@ sudo bash mediastack.sh
 cd /mnt/user/appdata
 mkdir -p mediastack-setup && cd mediastack-setup
 wget https://raw.githubusercontent.com/kernelguru/unraid-media-stack-/main/mediastack.sh
-# optional: eigene Einstellungen
-wget https://raw.githubusercontent.com/kernelguru/unraid-media-stack-/main/mediastack.conf.example -O mediastack.conf
-nano mediastack.conf
-
 bash mediastack.sh
+# danach liegt mediastack.conf mit allen Standardwerten im selben Ordner
 ```
 
 > Das Script ist interaktiv. Bitte **nicht** über das User-Scripts-Plugin starten, sondern im Terminal.
@@ -103,6 +100,20 @@ bash mediastack.sh
 5. Indexer in **Prowlarr** hinzufügen, falls du sie nicht über `INDEXERS` in der Konfig mitgegeben hast. Prowlarr verteilt sie automatisch an Radarr und Sonarr.
 
 Fertig. In Seerr (`http://<server-ip>:5055`) kannst du jetzt Filme und Serien anfragen.
+
+## Konfiguration (`mediastack.conf`)
+
+Beim ersten Lauf, also bei der Installation oder beim ersten `update` bzw. `self-update`, legt das Script **neben `mediastack.sh`** eine `mediastack.conf` an. Darin steht jede Einstellung **auskommentiert mit dem Wert, den das Script gerade verwendet**, passend zur erkannten Plattform:
+
+```bash
+#APPDATA="/mnt/user/appdata"         # Container-Configs
+#P_DASHBOARD=8090
+#ARR_ALLOWED_HOSTS=""
+```
+
+Zum Ändern das `#` entfernen, den Wert anpassen und dann `bash mediastack.sh update` ausführen. Eine vorhandene `mediastack.conf` wird **nie** überschrieben, auch nicht durch `self-update`. Die Datei hat die Rechte 600, weil darin z. B. ein Passwort stehen kann.
+
+Was das Script selbst erzeugt, also Passwort, API-Keys und WebDAV-Zugang, steht nicht dort, sondern in `appdata/mediastack/secrets.env`.
 
 ## Was automatisch konfiguriert wird
 

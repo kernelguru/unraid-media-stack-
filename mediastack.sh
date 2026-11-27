@@ -21,7 +21,7 @@
 #  "mediastack.conf" neben das Script legen (wird automatisch geladen).
 # =============================================================================
 set -Eeuo pipefail
-SCRIPT_VERSION="2.2.0"
+SCRIPT_VERSION="2.3.0"
 REPO_RAW="https://raw.githubusercontent.com/kernelguru/unraid-media-stack-/main"
 
 # ------------------------------- KONFIGURATION -------------------------------
@@ -315,6 +315,125 @@ run_ct() {  # name webui-port icon-url -- docker-args...
 }
 
 ICON="https://cdn.jsdelivr.net/gh/selfhst/icons/png"
+
+# ---- mediastack.conf mit Standardwerten anlegen (nur wenn sie fehlt) ----------
+# Alle Einstellungen stehen auskommentiert mit dem Wert, den das Script gerade
+# verwendet (für diese Plattform). Zum Ändern: "#" entfernen, Wert anpassen,
+# danach "bash mediastack.sh update".
+CONF_FILE="$SCRIPT_DIR/mediastack.conf"
+write_default_conf() {
+  [[ -e $CONF_FILE ]] && return 0
+  local q='"'
+  conf_arr() { local a; a=$(printf ' %s' "$@"); echo "(${a# })"; }
+  local tmp="$CONF_FILE.tmp.$$"
+  cat > "$tmp" <<EOF
+# =============================================================================
+#  mediastack.conf – eigene Einstellungen für mediastack.sh
+#
+#  Automatisch angelegt am $(date '+%d.%m.%Y %H:%M') (Script $SCRIPT_VERSION, Plattform: $PLATFORM).
+#  Jede Zeile zeigt den aktuell verwendeten Standardwert. Zum Ändern das "#"
+#  am Zeilenanfang entfernen, Wert anpassen und danach ausführen:
+#      bash mediastack.sh update
+#  Diese Datei wird von self-update und update nie überschrieben.
+# =============================================================================
+
+# ---- Plattform & System -------------------------------------------------------
+#PLATFORM="$PLATFORM"                 # auto | unraid | debian
+#SERVER_IP="$SERVER_IP"               # leer = automatisch erkennen
+#TZ="$TZ"
+#PUID=$PUID
+#PGID=$PGID
+#UMASK=$UMASK
+#INSTALL_DOCKER=$INSTALL_DOCKER       # Debian/Ubuntu: Docker aus dem offiziellen Repo
+
+# ---- Pfade --------------------------------------------------------------------
+#APPDATA="$APPDATA"                   # Container-Configs
+#DATA="$DATA"                         # Medien liegen in \$DATA/media/{movies,tv}
+#MOUNT_HOST="$MOUNT_HOST"             # rclone-Mount auf dem Host
+#MOUNT_CT="$MOUNT_CT"                 # derselbe Mount in den Containern
+
+# ---- Zugangsdaten -------------------------------------------------------------
+#ADMIN_USER="$ADMIN_USER"
+#ADMIN_PASS=""                        # leer = wird abgefragt bzw. aus secrets.env
+#ADMIN_EMAIL="$ADMIN_EMAIL"           # nur für Seerr
+# Zusätzliche Adressen für Radarr/Sonarr/Prowlarr (z. B. Reverse-Proxy-Domains),
+# kommagetrennt; Server-IP und Hostname sind automatisch enthalten
+#ARR_ALLOWED_HOSTS="$ARR_ALLOWED_HOSTS"
+
+# ---- Jellyfin -----------------------------------------------------------------
+#LANG_CODE="$LANG_CODE"
+#COUNTRY_CODE="$COUNTRY_CODE"
+#JELLYFIN_HWACCEL="$JELLYFIN_HWACCEL" # auto | none | qsv | vaapi | nvenc
+#JELLYFIN_HWACCEL_FORCE=$JELLYFIN_HWACCEL_FORCE
+
+# ---- InfiniDysk & rclone ------------------------------------------------------
+#CAT_MOVIES="$CAT_MOVIES"
+#CAT_TV="$CAT_TV"
+#RCLONE_MODE="$RCLONE_MODE"           # plugin (Unraid) | systemd (Debian) | container
+#RCLONE_REMOTE="$RCLONE_REMOTE"
+#RCLONE_CACHE_SIZE="$RCLONE_CACHE_SIZE"
+#RCLONE_CACHE_MAX_AGE="$RCLONE_CACHE_MAX_AGE"
+#RCLONE_READ_AHEAD="$RCLONE_READ_AHEAD"
+#RCLONE_RC=$RCLONE_RC                 # erst true, wenn InfiniDysk die RC-Daten kennt (README)
+#P_RCLONE_RC=$P_RCLONE_RC
+#P_WEBDAV=$P_WEBDAV                   # Host-Port für InfiniDysk-Backend (8080)
+
+# ---- TRaSH-Guides / Recyclarr -------------------------------------------------
+#RECYCLARR_ENABLED=$RECYCLARR_ENABLED
+#TRASH_PROFILES=$(conf_arr "${TRASH_PROFILES[@]}")
+#TRASH_ANY_GERMAN=$TRASH_ANY_GERMAN
+#RECYCLARR_SCHEDULE="$RECYCLARR_SCHEDULE"
+#SEERR_USE_TRASH_PROFILE=$SEERR_USE_TRASH_PROFILE
+#SEERR_PROFILE="$SEERR_PROFILE"
+
+# ---- Watchdog & Dashboard -----------------------------------------------------
+#WATCHDOG_ENABLED=$WATCHDOG_ENABLED
+#DASHBOARD_ENABLED=$DASHBOARD_ENABLED  # Seite ohne Login – nur im LAN!
+
+# ---- Ports --------------------------------------------------------------------
+#P_INFINIDYSK=$P_INFINIDYSK
+#P_PROWLARR=$P_PROWLARR
+#P_RADARR=$P_RADARR
+#P_SONARR=$P_SONARR
+#P_JELLYFIN=$P_JELLYFIN
+#P_SEERR=$P_SEERR
+#P_DASHBOARD=$P_DASHBOARD
+
+# ---- Images -------------------------------------------------------------------
+#IMG_INFINIDYSK="$IMG_INFINIDYSK"
+#IMG_RCLONE="$IMG_RCLONE"
+#IMG_PROWLARR="$IMG_PROWLARR"
+#IMG_RADARR="$IMG_RADARR"
+#IMG_SONARR="$IMG_SONARR"
+#IMG_JELLYFIN="$IMG_JELLYFIN"
+#IMG_SEERR="$IMG_SEERR"
+#IMG_RECYCLARR="$IMG_RECYCLARR"
+#IMG_DASHBOARD="$IMG_DASHBOARD"
+
+# ---- Zusätzliche Volumes ("host:container[:optionen]") ------------------------
+# Gibt es für jeden Container: JELLYFIN_, RADARR_, SONARR_, PROWLARR_, SEERR_,
+# INFINIDYSK_, RCLONE_NZBDAV_, RECYCLARR_, DASHBOARD_EXTRA_VOLUMES
+#JELLYFIN_EXTRA_VOLUMES=(
+#  "/pfad/auf/dem/host:/data/fotos:ro"
+#)
+#RADARR_EXTRA_VOLUMES=()
+#SONARR_EXTRA_VOLUMES=()
+
+# ---- Usenet-Indexer automatisch in Prowlarr anlegen ---------------------------
+# Format: "Name|https://indexer.tld|APIKEY"
+#INDEXERS=(
+#  ${q}NZBgeek|https://api.nzbgeek.info|DEIN_API_KEY${q}
+#)
+EOF
+  # nur eine vollständig geschriebene Datei übernehmen
+  if [[ -s $tmp ]] && bash -n "$tmp"; then
+    chmod 600 "$tmp"; mv -f "$tmp" "$CONF_FILE"
+  else
+    rm -f "$tmp"; unset -f conf_arr; warn "mediastack.conf konnte nicht angelegt werden"; return 0
+  fi
+  unset -f conf_arr
+  log "mediastack.conf mit Standardwerten angelegt: $CONF_FILE"
+}
 
 # ---- Allowed Hosts für Radarr/Sonarr/Prowlarr ------------------------------------
 arr_allowed_hosts() {
@@ -1237,6 +1356,7 @@ log "Pfade: Configs $APPDATA · Medien $DATA/media · Mount $MOUNT_HOST · Benut
 [[ -n $SERVER_IP ]] || SERVER_IP=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')
 [[ -n $SERVER_IP ]] || die "Server-IP nicht erkannt – bitte SERVER_IP setzen."
 log "Server-IP: $SERVER_IP"
+write_default_conf
 
 if (( PULL )); then
   log "Hole aktuelle Images"
