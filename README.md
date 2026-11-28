@@ -64,6 +64,11 @@ Auf jeder Karte gibt es zusätzlich **↻ Neu starten** für den jeweiligen Dien
 
 - **Login:** Die Knöpfe verlangen den Admin-Login der Apps (`ADMIN_USER`/`ADMIN_PASS`). Links, Status und Keys bleiben wie bisher ohne Login sichtbar.
 - **Nur im LAN:** nginx lässt `/api/` nur von privaten Adressen zu und lehnt Anfragen über einen Reverse Proxy ab (`X-Forwarded-For`). Über den Proxy siehst du das Dashboard, aber ohne Knöpfe.
+- **LAN-Proxy freigeben** (z. B. Zoraxy mit Zertifikat): in der `mediastack.conf` die IP des Proxys eintragen, dann `bash mediastack.sh update`.
+  ```bash
+  DASHBOARD_TRUSTED_PROXY="192.168.1.125"   # mehrere mit Leerzeichen, Netze als CIDR
+  ```
+  Nur dieser Proxy darf `X-Forwarded-For` schicken. Die echte Client-IP daraus muss ebenfalls privat sein. Der Login klappt auch über HTTPS mit eigenem Hostnamen. **Der Proxy-Eintrag fürs Dashboard darf nicht aus dem Internet erreichbar sein.**
 - **Erlaubte Aktionen:** nur diese vier. `remove`, der Wechsel des Mediaservers und alles mit Rückfragen bleiben in der Konsole.
 - **Technik:** Container `mediastack-agent` (Python, Docker-Socket). Jeder Lauf startet in einem kurzlebigen Container `mediastack-job` (`debian:stable-slim`, `nsenter` auf den Host). Er überlebt deshalb das Neuanlegen von Agent und Dashboard während eines Updates. Es läuft immer nur ein Lauf gleichzeitig. Das Protokoll des letzten Laufs liegt in `appdata/mediastack/agent/job.log`.
 

@@ -90,3 +90,6 @@
 #INDEXERS=(
 #  "NZBgeek|https://api.nzbgeek.info|DEIN_API_KEY"
 #)
+
+# LAN-Reverse-Proxy, über den die Dashboard-Knöpfe funktionieren dürfen (nur LAN!)
+#DASHBOARD_TRUSTED_PROXY="192.168.1.125"

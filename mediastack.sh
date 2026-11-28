@@ -23,7 +23,7 @@
 #  "mediastack.conf" neben das Script legen (wird automatisch geladen).
 # =============================================================================
 set -Eeuo pipefail
-SCRIPT_VERSION="2.6.2"
+SCRIPT_VERSION="2.6.3"
 REPO_RAW="https://raw.githubusercontent.com/kernelguru/unraid-media-stack-/main"
 
 # ------------------------------- KONFIGURATION -------------------------------
@@ -74,6 +74,8 @@ ARR_ALLOWED_HOSTS=""
 
 # Dashboard: kleine Webseite mit Links, API-Keys (verdeckt) und Status
 DASHBOARD_ENABLED=true
+# Reverse Proxy im LAN, über den die Dashboard-Knöpfe gehen dürfen (IPs/Netze, Leerzeichen)
+DASHBOARD_TRUSTED_PROXY=""
 
 LANG_CODE="de"                       # Jellyfin-UI/Metadaten
 COUNTRY_CODE="DE"
@@ -423,6 +425,7 @@ write_default_conf() {
 # ---- Watchdog & Dashboard -----------------------------------------------------
 #WATCHDOG_ENABLED=$WATCHDOG_ENABLED
 #DASHBOARD_ENABLED=$DASHBOARD_ENABLED  # Seite ohne Login – nur im LAN!
+#DASHBOARD_TRUSTED_PROXY="$DASHBOARD_TRUSTED_PROXY"  # LAN-Proxy für die Knöpfe, z. B. "192.168.1.125"
 
 # ---- Ports --------------------------------------------------------------------
 #P_INFINIDYSK=$P_INFINIDYSK
@@ -680,7 +683,8 @@ class H(BaseHTTPRequestHandler):
         if self.headers.get("X-Mediastack") != "1":
             return False
         o = self.headers.get("Origin")
-        return not o or re.sub(r"^https?://", "", o) == self.headers.get("Host", "")
+        hosts = {self.headers.get("Host", ""), self.headers.get("X-Forwarded-Host", "")} - {""}
+        return not o or re.sub(r"^https?://", "", o) in hosts
 
     def do_GET(self):
         p = self.path.split("?")[0]
@@ -752,26 +756,43 @@ PYAGENT
                  repo_raw:$repo, job_image:$img, containers:$ARGS.positional}' "${cts[@]}" \
      > "$AGENT_APP/agent.json.tmp" && chmod 600 "$AGENT_APP/agent.json.tmp" \
      && mv -f "$AGENT_APP/agent.json.tmp" "$AGENT_APP/agent.json"
-  # nginx: statische Seite + /api/ an den Agent – nur private Adressen, nicht über Proxys
-  cat > "$STATE_DIR/dashboard-nginx.conf" <<'NGX'
+  # nginx: statische Seite + /api/ an den Agent – nur private Adressen.
+  # Proxys werden abgelehnt, außer den in DASHBOARD_TRUSTED_PROXY genannten:
+  # deren X-Forwarded-For liefert die echte Client-IP (muss ebenfalls privat sein).
+  local ip realip="" trust=""
+  for ip in $DASHBOARD_TRUSTED_PROXY; do
+    [[ $ip =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}(/[0-9]{1,2})?$ ]] || { warn "DASHBOARD_TRUSTED_PROXY: '$ip' ist keine IPv4-Adresse – ignoriert"; continue; }
+    realip+="set_real_ip_from $ip;"$'\n'; trust+="  $ip 1;"$'\n'
+  done
+  [[ -n $realip ]] && realip+=$'real_ip_header X-Forwarded-For;\nreal_ip_recursive on;\n'
+  {
+    printf '%s' "$realip"
+    printf 'geo $realip_remote_addr $ms_trusted {\n  default 0;\n%s}\n' "$trust"
+    cat <<'NGX'
+map "$ms_trusted|$http_x_forwarded_host" $ms_fwdhost { default ""; "~^1\|(?<h>.+)$" $h; }
 server {
   listen 80;
   root /usr/share/nginx/html;
   location / { try_files $uri $uri/ =404; }
   location /api/ {
-    if ($http_x_forwarded_for) { return 403; }
-    if ($http_forwarded)       { return 403; }
+    set $ms_block 0;
+    if ($http_x_forwarded_for) { set $ms_block 1; }
+    if ($http_forwarded)       { set $ms_block 1; }
+    if ($ms_trusted)           { set $ms_block 0; }
+    if ($ms_block)             { return 403; }
     allow 127.0.0.0/8; allow 10.0.0.0/8; allow 172.16.0.0/12; allow 192.168.0.0/16; deny all;
     resolver 127.0.0.11 valid=10s ipv6=off;
     set $agent http://mediastack-agent:8091;
     proxy_pass $agent;
     proxy_set_header Host $http_host;
+    proxy_set_header X-Forwarded-Host $ms_fwdhost;
     proxy_buffering off;
     proxy_read_timeout 120s;
     client_max_body_size 8k;
   }
 }
 NGX
+  } > "$STATE_DIR/dashboard-nginx.conf"
   chmod 644 "$STATE_DIR/dashboard-nginx.conf"
 }
 
@@ -2701,7 +2722,8 @@ if [[ $DASHBOARD_ENABLED == true ]]; then
     --network mediastack -p "$P_DASHBOARD:80" -v "$DASH_DIR:/usr/share/nginx/html:ro" \
     -v "$STATE_DIR/dashboard-nginx.conf:/etc/nginx/conf.d/default.conf:ro" "$IMG_DASHBOARD"
   # geänderte nginx-Konfig übernehmen (Datei ist eingebunden, ändert den Hash nicht)
-  docker exec dashboard nginx -s reload >/dev/null 2>&1 || true
+  docker exec dashboard nginx -s reload >/dev/null 2>&1 \
+    || warn "  nginx konnte die Konfiguration nicht laden – Prüfen: docker exec dashboard nginx -t"
   install_dashboard_job
   log "  Status-Job aktiv (jede Minute) · Aktionen mit Admin-Login"
 else
