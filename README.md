@@ -49,6 +49,24 @@ Der Status wird **auf dem Server** geprüft, nicht im Browser. Ein Job läuft je
 
 Einstellungen: `DASHBOARD_ENABLED=true|false`, `P_DASHBOARD=8090`. Die Dateien liegen in `appdata/mediastack/dashboard/` (`index.html`, `apps.json`, `status.json`) und werden bei jedem Lauf des Scripts neu geschrieben.
 
+
+### Aktionen im Dashboard
+
+Oben im Dashboard steht die Script-Version. Gibt es auf GitHub eine neuere, siehst du **„Update verfügbar“**. Daneben liegen drei Knöpfe:
+
+| Knopf | entspricht |
+|---|---|
+| Self-Update | `bash mediastack.sh self-update`: neues Script, danach Update |
+| Update | `bash mediastack.sh update`: neue Images, geänderte Container neu anlegen |
+| Doctor | `bash mediastack.sh doctor --yes`: Mount prüfen und automatisch reparieren |
+
+Auf jeder Karte gibt es zusätzlich **↻ Neu starten** für den jeweiligen Dienst. Die Ausgabe läuft live in einem Konsolenfenster mit.
+
+- **Login:** Die Knöpfe verlangen den Admin-Login der Apps (`ADMIN_USER`/`ADMIN_PASS`). Links, Status und Keys bleiben wie bisher ohne Login sichtbar.
+- **Nur im LAN:** nginx lässt `/api/` nur von privaten Adressen zu und lehnt Anfragen über einen Reverse Proxy ab (`X-Forwarded-For`). Über den Proxy siehst du das Dashboard, aber ohne Knöpfe.
+- **Erlaubte Aktionen:** nur diese vier. `remove`, der Wechsel des Mediaservers und alles mit Rückfragen bleiben in der Konsole.
+- **Technik:** Container `mediastack-agent` (Python, Docker-Socket). Jeder Lauf startet in einem kurzlebigen Container `mediastack-job` (`debian:stable-slim`, `nsenter` auf den Host). Er überlebt deshalb das Neuanlegen von Agent und Dashboard während eines Updates. Es läuft immer nur ein Lauf gleichzeitig. Das Protokoll des letzten Laufs liegt in `appdata/mediastack/agent/job.log`.
+
 ## Plattformen
 
 Das Script erkennt die Plattform an `/etc/unraid-version` bzw. `/etc/os-release`. Erzwingen geht mit `PLATFORM=unraid|debian` in der `mediastack.conf`.

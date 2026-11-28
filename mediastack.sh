@@ -17,12 +17,13 @@
 #    bash mediastack.sh watchdog pause|resume -> Mount-Überwachung pausieren
 #    bash mediastack.sh dashboard-status -> Status fürs Dashboard schreiben (läuft minütlich)
 #    bash mediastack.sh remove          -> Container entfernen (Daten bleiben!)
+#  Self-Update, Update, Doctor und Neustarts gehen auch im Dashboard (Admin-Login, nur LAN).
 #
 #  Eigene Werte: entweder unten im Block "KONFIGURATION" ändern oder eine Datei
 #  "mediastack.conf" neben das Script legen (wird automatisch geladen).
 # =============================================================================
 set -Eeuo pipefail
-SCRIPT_VERSION="2.5.2"
+SCRIPT_VERSION="2.6.0"
 REPO_RAW="https://raw.githubusercontent.com/kernelguru/unraid-media-stack-/main"
 
 # ------------------------------- KONFIGURATION -------------------------------
@@ -118,6 +119,8 @@ IMG_EMBY="lscr.io/linuxserver/emby:latest"
 IMG_SEERR="ghcr.io/seerr-team/seerr:latest"
 IMG_RECYCLARR="ghcr.io/recyclarr/recyclarr:8"    # "latest" wird nicht mehr gepflegt
 IMG_DASHBOARD="nginx:alpine"
+IMG_AGENT="python:3-alpine"           # Dashboard-Aktionen
+IMG_JOB="debian:stable-slim"            # führt Script-Läufe aus (nsenter)
 IMG_WHISPARR="ghcr.io/hotio/whisparr:v3"
 
 # Ports
@@ -214,7 +217,7 @@ set_mediaserver_vars
 
 # Versteckter Schalter: bash mediastack.sh whisparr on|off
 WHISPARR_ENABLED=false; [[ -f $STATE_DIR/.whisparr ]] && WHISPARR_ENABLED=true
-CONTAINERS=(dashboard seerr jellyfin emby recyclarr whisparr sonarr radarr prowlarr rclone-nzbdav infinidysk)
+CONTAINERS=(dashboard mediastack-agent seerr jellyfin emby recyclarr whisparr sonarr radarr prowlarr rclone-nzbdav infinidysk)
 
 # ------------------------------- Hilfsfunktionen -----------------------------
 c_g=$'\e[32m'; c_y=$'\e[33m'; c_r=$'\e[31m'; c_b=$'\e[1m'; c_0=$'\e[0m'
@@ -521,6 +524,268 @@ write_status_json() {
   && chmod 644 "$DASH_DIR/status.json.tmp" && mv -f "$DASH_DIR/status.json.tmp" "$DASH_DIR/status.json"
 }
 
+# ---- Dashboard-Aktionen (Agent) -------------------------------------------------
+# Der Agent ist nur über das Dashboard-nginx (/api/, nur private Adressen,
+# kein Reverse Proxy) erreichbar und verlangt den Admin-Login der Apps.
+# Script-Läufe starten in einem eigenen Job-Container, damit sie das
+# Neuanlegen von Agent/Dashboard während eines Updates überleben.
+AGENT_APP="$STATE_DIR/agent-app"; AGENT_STATE="$STATE_DIR/agent"
+write_agent() {
+  mkdir -p "$AGENT_APP" "$AGENT_STATE"; chmod 700 "$AGENT_APP" "$AGENT_STATE"
+  cat > "$AGENT_APP/agent.py" <<'PYAGENT'
+#!/usr/bin/env python3
+# mediastack-agent: Aktionen fürs Dashboard (nur über das Dashboard-nginx, nur LAN).
+# Startet Script-Läufe in einem eigenen Job-Container (überlebt das Neuanlegen
+# von Agent/Dashboard) und startet Container über die Docker-API neu.
+import hmac, http.client, json, os, re, secrets, shlex, socket, threading, time, urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+CONF = json.load(open(os.environ.get("AGENT_CONF", "/app/agent.json")))
+STATE = "/state"                      # = CONF["state"] auf dem Host
+JOB = "mediastack-job"
+ACTIONS = {"self-update": ["self-update"], "update": ["update"], "doctor": ["doctor", "--yes"]}
+TTL = 8 * 3600
+sessions, lock, fails = {}, threading.Lock(), {"n": 0}
+remote = {"t": 0, "v": None}
+
+
+class Docker(http.client.HTTPConnection):
+    def __init__(self):
+        super().__init__("localhost", timeout=30)
+
+    def connect(self):
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.settimeout(120)
+        self.sock.connect("/var/run/docker.sock")
+
+
+def docker(method, path, body=None):
+    c = Docker()
+    data = json.dumps(body).encode() if body is not None else None
+    c.request(method, path, data, {"Content-Type": "application/json"} if data else {})
+    r = c.getresponse(); raw = r.read(); c.close()
+    try:
+        return r.status, json.loads(raw) if raw else None
+    except ValueError:
+        return r.status, raw.decode(errors="replace")
+
+
+def local_version():
+    try:
+        m = re.search(r'^SCRIPT_VERSION="([^"]+)"', open("/script/" + CONF["script_name"]).read(), re.M)
+        return m.group(1) if m else None
+    except OSError:
+        return None
+
+
+def remote_version():
+    if time.time() - remote["t"] > 1800:
+        try:
+            txt = urllib.request.urlopen(CONF["repo_raw"] + "/mediastack.sh", timeout=10).read(4096).decode()
+            m = re.search(r'^SCRIPT_VERSION="([^"]+)"', txt, re.M)
+            remote["v"] = m.group(1) if m else None
+        except Exception:
+            pass
+        remote["t"] = time.time()
+    return remote["v"]
+
+
+def newer(a, b):
+    try:
+        return tuple(map(int, a.split("."))) > tuple(map(int, b.split(".")))
+    except Exception:
+        return False
+
+
+def job_state():
+    st, info = docker("GET", f"/containers/{JOB}/json")
+    running = st == 200 and isinstance(info, dict) and info.get("State", {}).get("Running", False)
+    meta = {}
+    try:
+        meta = json.load(open(f"{STATE}/job.json"))
+    except (OSError, ValueError):
+        pass
+    rc = None
+    try:
+        rc = int(open(f"{STATE}/job.rc").read().strip())
+    except (OSError, ValueError):
+        pass
+    if not running and rc is None and meta:
+        rc = -1                      # Job-Container weg, ohne Exit-Code
+    return {"running": running, "action": meta.get("action"), "started": meta.get("started"),
+            "rc": None if running else rc}
+
+
+def start_job(action):
+    if job_state()["running"]:
+        return 409, {"error": "Es läuft bereits eine Aktion."}
+    args = " ".join(shlex.quote(a) for a in ACTIONS[action])
+    hs = CONF["state"]; log, rcf = f"{hs}/job.log", f"{hs}/job.rc"
+    for f in ("job.log", "job.rc"):
+        try: os.remove(f"{STATE}/{f}")
+        except OSError: pass
+    json.dump({"action": action, "started": time.strftime("%Y-%m-%dT%H:%M:%S%z")}, open(f"{STATE}/job.json", "w"))
+    script = (f"exec >{shlex.quote(log)} 2>&1 </dev/null; cd {shlex.quote(CONF['script_dir'])}; "
+              f"echo \"### {action} – $(date '+%d.%m.%Y %H:%M:%S')\"; "
+              f"bash {shlex.quote(CONF['self'])} {args}; rc=$?; echo; echo \"### Ende (Exit $rc)\"; "
+              f"echo $rc > {shlex.quote(rcf)}")
+    docker("DELETE", f"/containers/{JOB}?force=true")
+    st, r = docker("POST", f"/containers/create?name={JOB}", {
+        "Image": CONF["job_image"],
+        "Cmd": ["nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p", "--", "/bin/bash", "-c", script],
+        "Env": ["TERM=dumb"], "Labels": {"mediastack.job": action},
+        "HostConfig": {"Privileged": True, "PidMode": "host", "NetworkMode": "host", "AutoRemove": True}})
+    if st != 201:
+        return 500, {"error": f"Job-Container: {r}"}
+    st, r = docker("POST", f"/containers/{JOB}/start")
+    if st not in (204, 304):
+        return 500, {"error": f"Start fehlgeschlagen: {r}"}
+    return 200, {"ok": True}
+
+
+class H(BaseHTTPRequestHandler):
+    server_version = "mediastack-agent"
+
+    def log_message(self, *a):
+        pass
+
+    def send(self, code, obj):
+        b = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(b)))
+        self.end_headers(); self.wfile.write(b)
+
+    def authed(self):
+        t = self.headers.get("X-Auth-Token", "")
+        with lock:
+            exp = sessions.get(t)
+            if exp and exp > time.time():
+                sessions[t] = time.time() + TTL
+                return True
+        return False
+
+    def body(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        if n > 4096:
+            return None
+        try:
+            return json.loads(self.rfile.read(n) or b"{}")
+        except ValueError:
+            return None
+
+    def csrf_ok(self):
+        # Nur Anfragen der eigenen Seite: eigener Header + gleicher Origin
+        if self.headers.get("X-Mediastack") != "1":
+            return False
+        o = self.headers.get("Origin")
+        return not o or re.sub(r"^https?://", "", o) == self.headers.get("Host", "")
+
+    def do_GET(self):
+        p = self.path.split("?")[0]
+        if p == "/api/info":
+            lv, rv = local_version(), remote_version()
+            return self.send(200, {"local": lv, "remote": rv, "update": bool(lv and rv and newer(rv, lv)),
+                                   "job": job_state(), "authed": self.authed()})
+        if p == "/api/log":
+            if not self.authed():
+                return self.send(401, {"error": "Anmeldung erforderlich"})
+            try:
+                off = int(self.path.split("offset=")[1].split("&")[0]) if "offset=" in self.path else 0
+            except ValueError:
+                off = 0
+            data, size = "", 0
+            try:
+                with open(f"{STATE}/job.log", "rb") as f:
+                    f.seek(0, 2); size = f.tell()
+                    if off > size: off = 0
+                    f.seek(off); data = f.read(256 * 1024).decode(errors="replace"); size = f.tell()
+            except OSError:
+                pass
+            return self.send(200, {"data": data, "offset": size, "job": job_state()})
+        self.send(404, {"error": "unbekannt"})
+
+    def do_POST(self):
+        if not self.csrf_ok():
+            return self.send(403, {"error": "Anfrage abgelehnt"})
+        p, b = self.path.split("?")[0], self.body()
+        if b is None:
+            return self.send(400, {"error": "ungültig"})
+        if p == "/api/login":
+            ok = (hmac.compare_digest(str(b.get("user", "")).encode(), CONF["user"].encode())
+                  & hmac.compare_digest(str(b.get("pass", "")).encode(), CONF["pass"].encode()))
+            if not ok:
+                with lock: fails["n"] += 1
+                time.sleep(min(2 * fails["n"], 10))
+                return self.send(401, {"error": "Benutzer oder Passwort falsch"})
+            fails["n"] = 0
+            t = secrets.token_urlsafe(32)
+            with lock: sessions[t] = time.time() + TTL
+            return self.send(200, {"token": t})
+        if not self.authed():
+            return self.send(401, {"error": "Anmeldung erforderlich"})
+        if p == "/api/logout":
+            with lock: sessions.pop(self.headers.get("X-Auth-Token", ""), None)
+            return self.send(200, {"ok": True})
+        if p == "/api/run":
+            a = b.get("action")
+            if a not in ACTIONS:
+                return self.send(400, {"error": "unbekannte Aktion"})
+            return self.send(*start_job(a))
+        if p == "/api/restart":
+            c = b.get("container")
+            if c not in CONF["containers"]:
+                return self.send(400, {"error": "unbekannter Container"})
+            st, r = docker("POST", f"/containers/{c}/restart?t=30")
+            return self.send(200, {"ok": True}) if st == 204 else self.send(500, {"error": str(r)})
+        self.send(404, {"error": "unbekannt"})
+
+
+ThreadingHTTPServer(("0.0.0.0", 8091), H).serve_forever()
+PYAGENT
+  local cts=() c
+  for c in "${CONTAINERS[@]}"; do [[ $c == mediastack-agent ]] || cts+=("$c"); done
+  jq -n --arg u "$ADMIN_USER" --arg p "$ADMIN_PASS" --arg st "$AGENT_STATE" --arg self "$SELF" \
+        --arg dir "$SCRIPT_DIR" --arg name "$(basename "$SELF")" --arg repo "$REPO_RAW" --arg img "$IMG_JOB" \
+        --args '{user:$u, pass:$p, state:$st, self:$self, script_dir:$dir, script_name:$name,
+                 repo_raw:$repo, job_image:$img, containers:$ARGS.positional}' "${cts[@]}" \
+     > "$AGENT_APP/agent.json.tmp" && chmod 600 "$AGENT_APP/agent.json.tmp" \
+     && mv -f "$AGENT_APP/agent.json.tmp" "$AGENT_APP/agent.json"
+  # nginx: statische Seite + /api/ an den Agent – nur private Adressen, nicht über Proxys
+  cat > "$STATE_DIR/dashboard-nginx.conf" <<'NGX'
+server {
+  listen 80;
+  root /usr/share/nginx/html;
+  location / { try_files $uri $uri/ =404; }
+  location /api/ {
+    if ($http_x_forwarded_for) { return 403; }
+    if ($http_forwarded)       { return 403; }
+    allow 127.0.0.0/8; allow 10.0.0.0/8; allow 172.16.0.0/12; allow 192.168.0.0/16; deny all;
+    resolver 127.0.0.11 valid=10s ipv6=off;
+    set $agent http://mediastack-agent:8091;
+    proxy_pass $agent;
+    proxy_buffering off;
+    proxy_read_timeout 120s;
+    client_max_body_size 8k;
+  }
+}
+NGX
+  chmod 644 "$STATE_DIR/dashboard-nginx.conf"
+}
+
+start_agent() {
+  docker network inspect mediastack >/dev/null 2>&1 || docker network create mediastack >/dev/null
+  docker image inspect "$IMG_JOB" >/dev/null 2>&1 || docker pull -q "$IMG_JOB" >/dev/null || warn "Pull fehlgeschlagen: $IMG_JOB"
+  # Fingerabdruck von Code + Konfig -> Agent wird bei Änderungen neu angelegt
+  local sig; sig=$(cat "$AGENT_APP/agent.py" "$AGENT_APP/agent.json" | md5sum | cut -c1-12)
+  run_ct mediastack-agent "" "$ICON/python.png" -- \
+    --network mediastack -e "AGENT_SIG=$sig" \
+    -v /var/run/docker.sock:/var/run/docker.sock \
+    -v "$AGENT_STATE:/state" -v "$AGENT_APP:/app:ro" -v "$SCRIPT_DIR:/script:ro" \
+    "$IMG_AGENT" python3 -u /app/agent.py
+}
+
 # Minütlicher Status-Job: Unraid per Cron (dynamix-Ordner), sonst systemd-Timer
 DASH_CRON=/boot/config/plugins/dynamix/mediastack-dashboard.cron
 DASH_SERVICE=/etc/systemd/system/mediastack-dashboard.service
@@ -597,6 +862,11 @@ write_dashboard() {
        '.apps += [{name:"rclone RC", desc:"Remote Control", url:$u, ping:$u, icon:$i, user:$usr, key:$k, keyLabel:"Passwort"}]' \
        "$DASH_DIR/apps.json" > "$DASH_DIR/apps.json.tmp" && mv -f "$DASH_DIR/apps.json.tmp" "$DASH_DIR/apps.json"
   fi
+  jq --arg msn "$MS_LABEL" --arg msc "$MS_CT" '
+     ({Seerr:"seerr", Radarr:"radarr", Sonarr:"sonarr", Prowlarr:"prowlarr", InfiniDysk:"infinidysk",
+       Whisparr:"whisparr"} + {($msn): $msc}) as $m
+     | .apps |= map(. + (if $m[.name] then {ct: $m[.name]} else {} end))' \
+     "$DASH_DIR/apps.json" > "$DASH_DIR/apps.json.tmp" && mv -f "$DASH_DIR/apps.json.tmp" "$DASH_DIR/apps.json"
   chmod 644 "$DASH_DIR/apps.json"
 
   cat > "$DASH_DIR/index.html" <<'HTML'
@@ -637,6 +907,23 @@ write_dashboard() {
   button { border:1px solid var(--line); background:transparent; color:var(--text); border-radius:8px; padding:4px 8px; font-size:13px; cursor:pointer; }
   button:hover { border-color:var(--accent); }
   footer { color:var(--muted); font-size:12px; margin-top:20px; text-align:center; }
+  .ops { display:flex; align-items:center; gap:8px; flex-wrap:wrap; background:var(--card); border:1px solid var(--line);
+         border-radius:12px; padding:10px 14px; margin-bottom:16px; }
+  .ops #ver { flex:1; min-width:160px; font-size:14px; }
+  .ops #ver.upd { color:var(--accent); font-weight:600; }
+  button.primary { border-color:var(--accent); color:var(--accent); }
+  button:disabled { opacity:.5; cursor:default; }
+  .acts { display:none; justify-content:flex-end; }
+  body.agent .acts { display:flex; }
+  .console { background:#0b0d11; color:#d1d5db; border:1px solid var(--line); border-radius:12px; margin-bottom:16px; overflow:hidden; }
+  .chead { display:flex; align-items:center; gap:8px; padding:8px 12px; border-bottom:1px solid #262a33; font-size:14px; }
+  .chead span { flex:1; } .chead button { color:#d1d5db; }
+  .console pre { margin:0; padding:10px 12px; max-height:55vh; overflow:auto; font:12px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace; white-space:pre-wrap; word-break:break-word; }
+  dialog { border:1px solid var(--line); border-radius:12px; background:var(--card); color:var(--text); padding:18px; width:min(340px,90vw); }
+  dialog::backdrop { background:rgba(0,0,0,.45); }
+  dialog input { width:100%; margin:4px 0 10px; padding:8px; border:1px solid var(--line); border-radius:8px; background:var(--bg); color:var(--text); font-size:15px; }
+  dialog .err { color:var(--bad); font-size:13px; min-height:18px; }
+  dialog .row { display:flex; justify-content:flex-end; gap:8px; }
 </style>
 </head>
 <body>
@@ -645,6 +932,27 @@ write_dashboard() {
     <h1>Media-Stack</h1>
     <span class="meta" id="meta"></span>
   </header>
+  <div class="ops" id="ops" hidden>
+    <span id="ver">Script-Version wird geprüft …</span>
+    <button data-act="self-update" title="Script von GitHub holen, danach Update">Self-Update</button>
+    <button data-act="update" title="Images holen, geänderte Container neu anlegen">Update</button>
+    <button data-act="doctor" title="rclone-Mount prüfen und automatisch reparieren">Doctor</button>
+    <button id="showlog" hidden>Ausgabe</button>
+    <button id="logout" hidden>Abmelden</button>
+  </div>
+  <div class="console" id="console" hidden>
+    <div class="chead"><span id="ctitle"></span><button id="cclose">Schließen</button></div>
+    <pre id="clog"></pre>
+  </div>
+  <dialog id="login">
+    <form method="dialog" id="lform">
+      <b>Anmelden</b><div class="desc" style="margin:4px 0 12px">Admin-Login der Apps</div>
+      <label class="desc">Benutzer</label><input id="luser" autocomplete="username" autocapitalize="none" autocorrect="off" spellcheck="false">
+      <label class="desc">Passwort</label><input id="lpass" type="password" autocomplete="current-password">
+      <div class="err" id="lerr"></div>
+      <div class="row"><button value="cancel" formnovalidate>Abbrechen</button><button class="primary" id="lok" value="ok">Anmelden</button></div>
+    </form>
+  </dialog>
   <div class="mount"><span class="dot" id="mdot"></span><span id="mtext">rclone-Mount: Status wird geladen …</span></div>
   <div class="grid" id="grid"></div>
   <footer id="foot">Status wird vom Server jede Minute geprüft</footer>
@@ -669,6 +977,12 @@ function card(a, i) {
   el.querySelector('.name').textContent = a.name;
   el.querySelector('.desc').textContent = a.desc;
   const link = el.querySelector('a.open'); link.href = a.url; link.textContent = a.url;
+  if (a.ct) {
+    const r = document.createElement('div'); r.className = 'acts';
+    const b = document.createElement('button'); b.textContent = '↻ Neu starten';
+    b.onclick = () => restart(a, b);
+    r.appendChild(b); el.appendChild(r);
+  }
   if (a.user) {
     const u = document.createElement('div'); u.className = 'key';
     u.innerHTML = '<span class="label">Benutzer</span><code></code>';
@@ -720,6 +1034,135 @@ fetch('apps.json', { cache: 'no-store' }).then(r => r.json()).then(cfg => {
   refreshStatus(cfg.apps);
   setInterval(() => refreshStatus(cfg.apps), 30000);
 });
+
+// ---- Aktionen (Agent unter /api/, nur LAN, Admin-Login) ----------------------
+let token = null;
+try { token = sessionStorage.getItem('mstok'); } catch {}
+const $ = id => document.getElementById(id);
+const strip = t => t.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '').replace(/\r/g, '');
+const NAMES = { 'self-update': 'Self-Update', update: 'Update', doctor: 'Doctor' };
+
+function setToken(t) {
+  token = t;
+  try { t ? sessionStorage.setItem('mstok', t) : sessionStorage.removeItem('mstok'); } catch {}
+  $('logout').hidden = !t;
+}
+
+async function api(method, path, body) {
+  const h = { 'X-Mediastack': '1' };
+  if (body) h['Content-Type'] = 'application/json';
+  if (token) h['X-Auth-Token'] = token;
+  const r = await fetch('/api' + path, { method, headers: h, cache: 'no-store', body: body ? JSON.stringify(body) : undefined });
+  let j = {}; try { j = await r.json(); } catch {}
+  if (r.status === 401 && path !== '/login') setToken(null);
+  return Object.assign({ status: r.status }, j);
+}
+
+function login() {
+  return new Promise(resolve => {
+    const d = $('login'); $('lerr').textContent = ''; $('lpass').value = '';
+    d.showModal(); ($('luser').value ? $('lpass') : $('luser')).focus();
+    $('lform').onsubmit = async ev => {
+      if (ev.submitter && ev.submitter.value === 'cancel') return;
+      ev.preventDefault(); $('lok').disabled = true; $('lerr').textContent = '';
+      try {
+        const r = await api('POST', '/login', { user: $('luser').value.trim(), pass: $('lpass').value });
+        if (r.token) { setToken(r.token); d.close(); resolve(true); }
+        else $('lerr').textContent = r.error || 'Anmeldung fehlgeschlagen';
+      } catch { $('lerr').textContent = 'Agent nicht erreichbar'; }
+      $('lok').disabled = false;
+    };
+    d.onclose = () => { if (!token) resolve(false); };
+  });
+}
+
+async function withAuth(fn) {
+  if (!token && !(await login())) return null;
+  let r = await fn();
+  if (r.status === 401 && (await login())) r = await fn();
+  return r;
+}
+
+async function restart(a, b) {
+  if (!confirm(`${a.name} neu starten?`)) return;
+  b.disabled = true; b.textContent = 'Startet neu …';
+  try {
+    const r = await withAuth(() => api('POST', '/restart', { container: a.ct }));
+    b.textContent = !r ? '↻ Neu starten' : r.ok ? 'Neu gestartet ✓' : 'Fehler: ' + (r.error || r.status);
+  } catch { b.textContent = 'Agent nicht erreichbar'; }
+  setTimeout(() => { b.textContent = '↻ Neu starten'; b.disabled = false; }, 3000);
+}
+
+let polling = false;
+function busy(on) { document.querySelectorAll('[data-act]').forEach(b => b.disabled = on); }
+
+async function follow(action) {
+  if (polling) { $('console').hidden = false; return; }
+  polling = true; busy(true);
+  const pre = $('clog'), title = $('ctitle');
+  $('console').hidden = false; pre.textContent = ''; title.textContent = `${NAMES[action] || action} läuft …`;
+  let off = 0, done = 0, lost = 0;
+  while (polling) {
+    try {
+      const r = await api('GET', '/log?offset=' + off);
+      if (r.status === 401) { title.textContent = 'Anmeldung abgelaufen'; if (!(await login())) break; continue; }
+      if (r.status !== 200) throw new Error(r.status);
+      lost = 0;
+      if (r.offset < off) pre.textContent = '';
+      if (r.data) {
+        const end = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 20;
+        pre.textContent += strip(r.data);
+        if (end) pre.scrollTop = pre.scrollHeight;
+      }
+      off = r.offset;
+      const j = r.job || {};
+      if (j.running) { done = 0; title.textContent = `${NAMES[j.action] || j.action} läuft …`; }
+      else if (j.rc !== null && j.rc !== undefined && ++done >= 2) {
+        title.textContent = j.rc === 0 ? `${NAMES[j.action] || j.action} fertig ✓` : `${NAMES[j.action] || j.action} beendet mit Fehler (Exit ${j.rc})`;
+        break;
+      }
+    } catch {
+      // Während eines Updates werden Dashboard/Agent neu angelegt – kurz warten
+      title.textContent = ++lost > 3 ? 'Verbindung unterbrochen – Dashboard startet evtl. neu …' : title.textContent;
+    }
+    await new Promise(res => setTimeout(res, 1500));
+  }
+  polling = false; busy(false); info();
+}
+
+async function run(action) {
+  const warn = { 'self-update': 'Script von GitHub holen und danach ein Update ausführen?',
+                 update: 'Update ausführen? Geänderte Container werden neu angelegt.',
+                 doctor: 'Doctor ausführen? Gefundene Mount-Probleme werden automatisch repariert.' };
+  if (!confirm(warn[action])) return;
+  try {
+    const r = await withAuth(() => api('POST', '/run', { action }));
+    if (!r) return;
+    if (r.ok || r.status === 409) follow(action);
+    else alert(r.error || 'Fehler ' + r.status);
+  } catch { alert('Agent nicht erreichbar'); }
+}
+
+async function info() {
+  let r;
+  try { r = await api('GET', '/info'); } catch { return; }
+  if (r.status !== 200) return;              // kein Agent (z. B. über Reverse Proxy) -> keine Knöpfe
+  document.body.classList.add('agent'); $('ops').hidden = false; $('logout').hidden = !token;
+  const v = $('ver');
+  if (r.update) { v.className = 'upd'; v.textContent = `Update verfügbar: ${r.local} → ${r.remote}`; }
+  else { v.className = ''; v.textContent = `Script ${r.local || '?'}` + (r.remote ? ' · aktuell' : ' · GitHub nicht erreichbar'); }
+  const j = r.job || {};
+  $('showlog').hidden = !(j.action);
+  if (j.running && !polling && token) follow(j.action);
+  else if (j.running) { busy(true); v.textContent += ` · ${NAMES[j.action] || j.action} läuft`; }
+}
+
+document.querySelectorAll('[data-act]').forEach(b => b.onclick = () => run(b.dataset.act));
+$('cclose').onclick = () => { $('console').hidden = true; };
+$('showlog').onclick = async () => { if (await withAuth(() => api('GET', '/log?offset=0'))) { const r = await api('GET', '/info'); follow((r.job || {}).action); } };
+$('logout').onclick = async () => { try { await api('POST', '/logout', {}); } catch {} setToken(null); };
+info();
+setInterval(() => { if (!polling) info(); }, 60000);
 </script>
 </body>
 </html>
@@ -2250,12 +2693,16 @@ if [[ $DASHBOARD_ENABLED == true ]]; then
   log "Dashboard"
   write_dashboard
   if host_healthy 2>/dev/null; then write_mount_status 0; else write_mount_status 1 "Mount bei der Installation nicht sichtbar"; fi
+  write_agent
+  start_agent
   run_ct dashboard "$P_DASHBOARD" "$ICON/homepage.png" -- \
-    -p "$P_DASHBOARD:80" -v "$DASH_DIR:/usr/share/nginx/html:ro" "$IMG_DASHBOARD"
+    --network mediastack -p "$P_DASHBOARD:80" -v "$DASH_DIR:/usr/share/nginx/html:ro" \
+    -v "$STATE_DIR/dashboard-nginx.conf:/etc/nginx/conf.d/default.conf:ro" "$IMG_DASHBOARD"
   install_dashboard_job
-  log "  Status-Job aktiv (jede Minute)"
-elif exists dashboard; then
-  remove_ct dashboard
+  log "  Status-Job aktiv (jede Minute) · Aktionen mit Admin-Login"
+else
+  exists dashboard && remove_ct dashboard
+  exists mediastack-agent && remove_ct mediastack-agent
   install_dashboard_job
 fi
 
