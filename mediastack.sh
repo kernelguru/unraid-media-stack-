@@ -23,7 +23,7 @@
 #  "mediastack.conf" neben das Script legen (wird automatisch geladen).
 # =============================================================================
 set -Eeuo pipefail
-SCRIPT_VERSION="2.6.3"
+SCRIPT_VERSION="2.7.0"
 REPO_RAW="https://raw.githubusercontent.com/kernelguru/unraid-media-stack-/main"
 
 # ------------------------------- KONFIGURATION -------------------------------
@@ -92,6 +92,9 @@ RCLONE_READ_AHEAD="512M"             # --vfs-read-ahead (Puffer für hohe Bitrat
 # vfs/forget an rclone. Dann darf der Verzeichnis-Cache lang sein (1w statt 20s).
 # Nur einschalten, wenn InfiniDysk die RC-Daten auch kennt (s. README).
 RCLONE_RC=false
+# InfiniDysk: Radarr/Sonarr, Health-Checks, Reparatur und Queue-Regeln automatisch
+# setzen (in der InfiniDysk-Oberfläche dann schreibgeschützt). false = selbst pflegen
+INFINIDYSK_ARR=true
 P_RCLONE_RC=5572
 RC_USER=""                           # rclone RC: leer = "rclone"
 RC_PASS=""                           # rclone RC: leer = zufällig (secrets.env)
@@ -410,6 +413,7 @@ write_default_conf() {
 #RCLONE_READ_AHEAD="$RCLONE_READ_AHEAD"
 #RCLONE_RC=$RCLONE_RC                 # erst true, wenn InfiniDysk die RC-Daten kennt (README)
 #P_RCLONE_RC=$P_RCLONE_RC
+#INFINIDYSK_ARR=$INFINIDYSK_ARR          # Arr-Instanzen, Reparatur, Queue-Regeln in InfiniDysk setzen
 #RC_USER="$RC_USER"                  # Benutzer der rclone Remote Control
 #RC_PASS=""                         # leer = zufällig, steht in secrets.env
 #P_WEBDAV=$P_WEBDAV                   # Host-Port für InfiniDysk-Backend (8080)
@@ -2083,10 +2087,39 @@ if [[ $RCLONE_RC == true ]]; then
            -e "NZBDAV_CONFIG__RCLONE__USER=$RC_USER"
            -e "NZBDAV_CONFIG__RCLONE__PASS=$RC_PASS")
 fi
+# Arr-Anbindung: Health-Checks, Reparatur über Radarr/Sonarr, Queue-Management.
+# Queue-Regeln nach den Empfehlungen der InfiniDysk-Doku; nicht aufgeführte
+# Meldungen (ID-Abgleich, Ordnername, Staffel/Episode) bleiben "Nichts tun".
+# Aktionen: 0 Nichts tun · 1 Entfernen · 2 + Blocklist · 3 + Blocklist + Suche
+ND_VOL=()
+if [[ $INFINIDYSK_ARR == true ]]; then
+  ND_ARR=$(jq -nc --arg ra "http://$SERVER_IP:$P_RADARR" --arg rk "$KEY_RADARR" \
+                  --arg sa "http://$SERVER_IP:$P_SONARR" --arg sk "$KEY_SONARR" '{
+    RadarrInstances: [{Name:"Radarr", Host:$ra, ApiKey:$rk, Enabled:true}],
+    SonarrInstances: [{Name:"Sonarr", Host:$sa, ApiKey:$sk, Enabled:true}],
+    QueueRules: [
+      {Message:"No files found are eligible for import",           Action:3},
+      {Message:"Sample",                                           Action:3},
+      {Message:"Unable to determine if file is a sample",          Action:3},
+      {Message:"No audio tracks detected",                         Action:3},
+      {Message:"Found archive file, might need to be extracted",   Action:3},
+      {Message:"Not an upgrade for existing movie file",           Action:2},
+      {Message:"Not an upgrade for existing episode file(s)",      Action:2},
+      {Message:"Not a Custom Format upgrade",                      Action:2},
+      {Message:"Episode file already imported",                    Action:1}
+    ],
+    QueueReplacementSearchLimit: 3,
+    QueueReplacementSearchWindowMinutes: 30 }')
+  ND_ENV+=(-e "NZBDAV_CONFIG__ARR__INSTANCES=$ND_ARR"
+           -e NZBDAV_CONFIG__REPAIR__ENABLE=true
+           -e NZBDAV_CONFIG__MEDIA__LIBRARY_DIR=/data/media)
+  # Bibliothek unter demselben Pfad wie in Radarr/Sonarr (Symlinks → Reparatur)
+  ND_VOL=(-v "$DATA/media:/data/media")
+fi
 run_ct infinidysk $P_INFINIDYSK "" -- \
   "${LSIO_ENV[@]}" "${ND_ENV[@]}" \
   -p $P_INFINIDYSK:3000 -p "127.0.0.1:$P_WEBDAV:8080" \
-  -v "$APPDATA/infinidysk:/config" \
+  -v "$APPDATA/infinidysk:/config" "${ND_VOL[@]}" \
   "$IMG_INFINIDYSK"
 
 ND="http://$SERVER_IP:$P_INFINIDYSK"

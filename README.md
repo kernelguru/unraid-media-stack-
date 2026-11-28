@@ -174,6 +174,23 @@ bash mediastack.sh watchdog pause     # Mount-Überwachung pausieren (resume = f
 bash mediastack.sh remove             # Container entfernen (Configs und Medien bleiben erhalten)
 ```
 
+## InfiniDysk: Arr-Anbindung, Health-Checks und Reparatur
+
+Das Script trägt in InfiniDysk automatisch ein (`INFINIDYSK_ARR=true`, Standard):
+
+- **Arr-Instanzen:** Radarr und Sonarr mit ihren API-Keys. Damit laufen Arr-Health auf der Übersicht, das Queue-Management und Reparaturen über die Arr-Apps.
+- **Reparatur** an (`repair.enable`), Bibliotheksverzeichnis `/data/media` (`media.library-dir`). Die Bibliothek wird dafür mit Schreibzugriff unter demselben Pfad wie in Radarr und Sonarr eingebunden.
+- **Queue-Regeln** nach den Empfehlungen der InfiniDysk-Doku:
+
+| Meldung in Radarr/Sonarr | Aktion |
+|---|---|
+| No files found are eligible for import · Sample · Unable to determine if file is a sample · No audio tracks detected · Found archive file | Entfernen, Blocklist, neu suchen |
+| Not an upgrade (Film/Episode) · Not a Custom Format upgrade | Entfernen + Blocklist |
+| Episode file already imported | Entfernen |
+| ID-Abgleich, Ordnername, Staffel/Episode passt nicht | Nichts tun (manuell prüfen) |
+
+Neue Suchen sind auf höchstens 3 innerhalb von 30 Minuten pro Film oder Episode begrenzt. Die Werte setzt das Script per `NZBDAV_CONFIG__…`. In der InfiniDysk-Oberfläche sind sie deshalb schreibgeschützt. Wer sie selbst pflegen will, setzt `INFINIDYSK_ARR=false`.
+
 ## Mediaserver: Jellyfin oder Emby
 
 Bei der **Erstinstallation** fragt das Script, welcher Mediaserver installiert werden soll. Standard ist Jellyfin. Fest vorgeben lässt er sich mit `MEDIASERVER=jellyfin|emby` in der `mediastack.conf`.
