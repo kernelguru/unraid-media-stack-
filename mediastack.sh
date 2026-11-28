@@ -23,7 +23,7 @@
 #  "mediastack.conf" neben das Script legen (wird automatisch geladen).
 # =============================================================================
 set -Eeuo pipefail
-SCRIPT_VERSION="2.7.1"
+SCRIPT_VERSION="2.7.2"
 REPO_RAW="https://raw.githubusercontent.com/kernelguru/unraid-media-stack-/main"
 
 # ------------------------------- KONFIGURATION -------------------------------
@@ -640,7 +640,7 @@ def start_job(action):
     st, r = docker("POST", f"/containers/create?name={JOB}", {
         "Image": CONF["job_image"],
         "Cmd": ["nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p", "--", "/bin/bash", "-c", script],
-        "Env": ["TERM=dumb"], "Labels": {"mediastack.job": action},
+        "Env": ["TERM=dumb", "TZ=" + CONF.get("tz", "UTC")], "Labels": {"mediastack.job": action},
         "HostConfig": {"Privileged": True, "PidMode": "host", "NetworkMode": "host", "AutoRemove": True}})
     if st != 201:
         return 500, {"error": f"Job-Container: {r}"}
@@ -755,9 +755,9 @@ PYAGENT
   local cts=() c
   for c in "${CONTAINERS[@]}"; do [[ $c == mediastack-agent ]] || cts+=("$c"); done
   jq -n --arg u "$ADMIN_USER" --arg p "$ADMIN_PASS" --arg st "$AGENT_STATE" --arg self "$SELF" \
-        --arg dir "$SCRIPT_DIR" --arg name "$(basename "$SELF")" --arg repo "$REPO_RAW" --arg img "$IMG_JOB" \
+        --arg dir "$SCRIPT_DIR" --arg name "$(basename "$SELF")" --arg repo "$REPO_RAW" --arg img "$IMG_JOB" --arg tz "$TZ" \
         --args '{user:$u, pass:$p, state:$st, self:$self, script_dir:$dir, script_name:$name,
-                 repo_raw:$repo, job_image:$img, containers:$ARGS.positional}' "${cts[@]}" \
+                 repo_raw:$repo, job_image:$img, tz:$tz, containers:$ARGS.positional}' "${cts[@]}" \
      > "$AGENT_APP/agent.json.tmp" && chmod 600 "$AGENT_APP/agent.json.tmp" \
      && mv -f "$AGENT_APP/agent.json.tmp" "$AGENT_APP/agent.json"
   # nginx: statische Seite + /api/ an den Agent – nur private Adressen.
