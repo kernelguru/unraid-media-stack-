@@ -23,7 +23,7 @@
 #  "mediastack.conf" neben das Script legen (wird automatisch geladen).
 # =============================================================================
 set -Eeuo pipefail
-SCRIPT_VERSION="2.6.0"
+SCRIPT_VERSION="2.6.1"
 REPO_RAW="https://raw.githubusercontent.com/kernelguru/unraid-media-stack-/main"
 
 # ------------------------------- KONFIGURATION -------------------------------
@@ -765,6 +765,7 @@ server {
     resolver 127.0.0.11 valid=10s ipv6=off;
     set $agent http://mediastack-agent:8091;
     proxy_pass $agent;
+    proxy_set_header Host $http_host;
     proxy_buffering off;
     proxy_read_timeout 120s;
     client_max_body_size 8k;
@@ -907,6 +908,7 @@ write_dashboard() {
   button { border:1px solid var(--line); background:transparent; color:var(--text); border-radius:8px; padding:4px 8px; font-size:13px; cursor:pointer; }
   button:hover { border-color:var(--accent); }
   footer { color:var(--muted); font-size:12px; margin-top:20px; text-align:center; }
+  [hidden] { display:none !important; }
   .ops { display:flex; align-items:center; gap:8px; flex-wrap:wrap; background:var(--card); border:1px solid var(--line);
          border-radius:12px; padding:10px 14px; margin-bottom:16px; }
   .ops #ver { flex:1; min-width:160px; font-size:14px; }
