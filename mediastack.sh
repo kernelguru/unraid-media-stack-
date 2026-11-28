@@ -23,7 +23,7 @@
 #  "mediastack.conf" neben das Script legen (wird automatisch geladen).
 # =============================================================================
 set -Eeuo pipefail
-SCRIPT_VERSION="2.7.0"
+SCRIPT_VERSION="2.7.1"
 REPO_RAW="https://raw.githubusercontent.com/kernelguru/unraid-media-stack-/main"
 
 # ------------------------------- KONFIGURATION -------------------------------
@@ -1265,9 +1265,16 @@ detect_ip() {
 
 # WebDAV-URL wählen: Backend-Port (empfohlen) oder Frontend-Port 3000 als Fallback
 detect_dav() {
-  local code
-  code=$(curl -s -o /dev/null -m 5 -w '%{http_code}' -X PROPFIND -H 'Depth: 0' \
-         "http://127.0.0.1:$P_WEBDAV/" 2>/dev/null || true)
+  local code i tries=1
+  # Backend-Port veröffentlicht? Dann nach einem (Neu-)Start bis zu 90 s auf ihn
+  # warten – das Backend ist oft erst nach dem Frontend bereit.
+  docker port infinidysk 8080 2>/dev/null | grep -q ":$P_WEBDAV\$" && tries=30
+  for (( i = 1; i <= tries; i++ )); do
+    code=$(curl -s -o /dev/null -m 5 -w '%{http_code}' -X PROPFIND -H 'Depth: 0' \
+           "http://127.0.0.1:$P_WEBDAV/" 2>/dev/null || true)
+    [[ $code =~ ^[2-4][0-9][0-9]$ ]] && break
+    (( i < tries )) && sleep 3
+  done
   if [[ $code =~ ^[2-4][0-9][0-9]$ ]]; then
     DAV_URL="http://127.0.0.1:$P_WEBDAV/"; DAV_BACKEND=1
   else
