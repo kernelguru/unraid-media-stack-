@@ -23,7 +23,7 @@
 #  "mediastack.conf" neben das Script legen (wird automatisch geladen).
 # =============================================================================
 set -Eeuo pipefail
-SCRIPT_VERSION="2.6.1"
+SCRIPT_VERSION="2.6.2"
 REPO_RAW="https://raw.githubusercontent.com/kernelguru/unraid-media-stack-/main"
 
 # ------------------------------- KONFIGURATION -------------------------------
@@ -2700,6 +2700,8 @@ if [[ $DASHBOARD_ENABLED == true ]]; then
   run_ct dashboard "$P_DASHBOARD" "$ICON/homepage.png" -- \
     --network mediastack -p "$P_DASHBOARD:80" -v "$DASH_DIR:/usr/share/nginx/html:ro" \
     -v "$STATE_DIR/dashboard-nginx.conf:/etc/nginx/conf.d/default.conf:ro" "$IMG_DASHBOARD"
+  # geänderte nginx-Konfig übernehmen (Datei ist eingebunden, ändert den Hash nicht)
+  docker exec dashboard nginx -s reload >/dev/null 2>&1 || true
   install_dashboard_job
   log "  Status-Job aktiv (jede Minute) · Aktionen mit Admin-Login"
 else
