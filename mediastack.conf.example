@@ -44,6 +44,8 @@
 #RCLONE_CACHE_SIZE="50G"
 #RCLONE_CACHE_MAX_AGE="1w"
 #RCLONE_READ_AHEAD="512M"
+#RC_USER=""          # rclone RC-Benutzer (leer = rclone)
+#RC_PASS=""          # rclone RC-Passwort (leer = zufällig, secrets.env)
 #RCLONE_RC=false          # erst true, wenn InfiniDysk die RC-Daten kennt (README)
 #P_WEBDAV=18080           # Host-Port für den InfiniDysk-Backend-Port 8080
 

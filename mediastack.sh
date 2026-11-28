@@ -22,7 +22,7 @@
 #  "mediastack.conf" neben das Script legen (wird automatisch geladen).
 # =============================================================================
 set -Eeuo pipefail
-SCRIPT_VERSION="2.5.1"
+SCRIPT_VERSION="2.5.2"
 REPO_RAW="https://raw.githubusercontent.com/kernelguru/unraid-media-stack-/main"
 
 # ------------------------------- KONFIGURATION -------------------------------
@@ -90,6 +90,8 @@ RCLONE_READ_AHEAD="512M"             # --vfs-read-ahead (Puffer für hohe Bitrat
 # Nur einschalten, wenn InfiniDysk die RC-Daten auch kennt (s. README).
 RCLONE_RC=false
 P_RCLONE_RC=5572
+RC_USER=""                           # rclone RC: leer = "rclone"
+RC_PASS=""                           # rclone RC: leer = zufällig (secrets.env)
 # WebDAV über den Backend-Port 8080 von InfiniDysk (schneller als Port 3000).
 # Host-Port, nur an 127.0.0.1 gebunden (rclone läuft auf dem Host).
 P_WEBDAV=18080
@@ -197,6 +199,7 @@ host_mode() { [[ $RCLONE_MODE == plugin || $RCLONE_MODE == systemd ]]; }
 
 STATE_DIR="$APPDATA/mediastack"
 SECRETS="$STATE_DIR/secrets.env"
+RC_USER=${RC_USER:-rclone}; RC_PASS_CONF=${RC_PASS:-}
 # Mediaserver: mediastack.conf > gespeicherte Wahl > (Erstinstallation: Frage)
 MS_STATE="$STATE_DIR/mediaserver"
 MS_FROM_CONF=${MEDIASERVER:-}
@@ -402,6 +405,8 @@ write_default_conf() {
 #RCLONE_READ_AHEAD="$RCLONE_READ_AHEAD"
 #RCLONE_RC=$RCLONE_RC                 # erst true, wenn InfiniDysk die RC-Daten kennt (README)
 #P_RCLONE_RC=$P_RCLONE_RC
+#RC_USER="$RC_USER"                  # Benutzer der rclone Remote Control
+#RC_PASS=""                         # leer = zufällig, steht in secrets.env
 #P_WEBDAV=$P_WEBDAV                   # Host-Port für InfiniDysk-Backend (8080)
 
 # ---- TRaSH-Guides / Recyclarr -------------------------------------------------
@@ -491,14 +496,15 @@ dash_checks() {
   printf '%s\n' "Seerr|$P_SEERR|/api/v1/status" "$MS_LABEL|$P_JELLYFIN|$MS_PING" "Radarr|$P_RADARR|/ping" \
     "Sonarr|$P_SONARR|/ping" "Prowlarr|$P_PROWLARR|/ping" "InfiniDysk|$P_INFINIDYSK|/"
   [[ $WHISPARR_ENABLED == true ]] && echo "Whisparr|$P_WHISPARR|/ping"
+  [[ $RCLONE_RC == true ]] && echo "rclone RC|$P_RCLONE_RC|/|$SERVER_IP"
   return 0
 }
 write_status_json() {
   [[ $DASHBOARD_ENABLED == true && -d $DASH_DIR ]] || return 0
-  local e name port path code apps='{}' mok=false detail="" doc='{}'
+  local e name port path host code apps='{}' mok=false detail="" doc='{}'
   while IFS= read -r e; do
-    IFS='|' read -r name port path <<<"$e"
-    code=$(curl -s -o /dev/null -m 5 -w '%{http_code}' "http://127.0.0.1:$port$path" 2>/dev/null || true)
+    IFS='|' read -r name port path host <<<"$e"
+    code=$(curl -s -o /dev/null -m 5 -w '%{http_code}' "http://${host:-127.0.0.1}:$port$path" 2>/dev/null || true)
     apps=$(jq -c --arg n "$name" --argjson up "$([[ $code =~ ^[2-4][0-9][0-9]$ ]] && echo true || echo false)" \
            '. + {($n): $up}' <<<"$apps")
   done < <(dash_checks)
@@ -586,6 +592,11 @@ write_dashboard() {
        '.apps += [{name:"Whisparr", desc:"Adult", url:$u, ping:($u + "ping"), icon:$i, key:$k}]' \
        "$DASH_DIR/apps.json" > "$DASH_DIR/apps.json.tmp" && mv -f "$DASH_DIR/apps.json.tmp" "$DASH_DIR/apps.json"
   fi
+  if [[ $RCLONE_RC == true ]]; then
+    jq --arg u "http://$SERVER_IP:$P_RCLONE_RC/" --arg i "$ICON/rclone.png" --arg usr "$RC_USER" --arg k "${RC_PASS:-}" \
+       '.apps += [{name:"rclone RC", desc:"Remote Control", url:$u, ping:$u, icon:$i, user:$usr, key:$k, keyLabel:"Passwort"}]' \
+       "$DASH_DIR/apps.json" > "$DASH_DIR/apps.json.tmp" && mv -f "$DASH_DIR/apps.json.tmp" "$DASH_DIR/apps.json"
+  fi
   chmod 644 "$DASH_DIR/apps.json"
 
   cat > "$DASH_DIR/index.html" <<'HTML'
@@ -658,9 +669,16 @@ function card(a, i) {
   el.querySelector('.name').textContent = a.name;
   el.querySelector('.desc').textContent = a.desc;
   const link = el.querySelector('a.open'); link.href = a.url; link.textContent = a.url;
+  if (a.user) {
+    const u = document.createElement('div'); u.className = 'key';
+    u.innerHTML = '<span class="label">Benutzer</span><code></code>';
+    u.querySelector('code').textContent = a.user;
+    el.appendChild(u);
+  }
   if (a.key) {
     const k = document.createElement('div'); k.className = 'key';
-    k.innerHTML = '<span class="label">API-Key</span><code></code><button class="show" title="Anzeigen">👁</button><button class="copy">Kopieren</button>';
+    k.innerHTML = '<span class="label"></span><code></code><button class="show" title="Anzeigen">👁</button><button class="copy">Kopieren</button>';
+    k.querySelector('.label').textContent = a.keyLabel || 'API-Key';
     const code = k.querySelector('code'); code.textContent = MASK;
     k.querySelector('.show').onclick = () => { code.textContent = code.textContent === MASK ? a.key : MASK; };
     const cb = k.querySelector('.copy');
@@ -798,8 +816,9 @@ build_rclone_flags() {
     --vfs-cache-max-age="$RCLONE_CACHE_MAX_AGE" --buffer-size=0
     --vfs-read-ahead="$RCLONE_READ_AHEAD")
   if [[ $RCLONE_RC == true ]]; then
+    detect_ip
     RCLONE_FLAGS+=(--dir-cache-time=1w --poll-interval=0
-      --rc --rc-addr=":$P_RCLONE_RC" --rc-user=rclone --rc-pass="${RC_PASS:-}")
+      --rc --rc-addr="${SERVER_IP}:$P_RCLONE_RC" --rc-user="$RC_USER" --rc-pass="${RC_PASS:-}")
   else
     RCLONE_FLAGS+=(--dir-cache-time=20s)
   fi
@@ -1327,6 +1346,7 @@ run_doctor() {
   detect_ip
   ND="http://$SERVER_IP:$P_INFINIDYSK"
   [[ -f $SECRETS ]] && source "$SECRETS"
+  [[ -n $RC_PASS_CONF ]] && RC_PASS=$RC_PASS_CONF
   local round
   for round in 1 2 3 4 5; do
     (( DOC_QUIET )) || echo "${c_b}── rclone-Mount: Prüfung $round ──${c_0}"
@@ -1523,6 +1543,7 @@ fi
 
 mkdir -p "$STATE_DIR"
 [[ -f $SECRETS ]] && source "$SECRETS"
+[[ -n $RC_PASS_CONF ]] && RC_PASS=$RC_PASS_CONF
 
 if [[ -z $ADMIN_PASS ]]; then
   while :; do
@@ -1533,7 +1554,8 @@ if [[ -z $ADMIN_PASS ]]; then
   done
 fi
 save_secret ADMIN_USER "$ADMIN_USER"; save_secret ADMIN_PASS "$ADMIN_PASS"
-[[ -n ${RC_PASS:-} ]] || { RC_PASS=$(genkey); save_secret RC_PASS "$RC_PASS"; }
+[[ -n ${RC_PASS:-} ]] || RC_PASS=$(genkey)
+save_secret RC_PASS "$RC_PASS"
 
 # ------------------------------- 1. Ordner -----------------------------------
 log "Lege Ordner an"
@@ -1592,7 +1614,7 @@ ND_ENV=(-e NZBDAV_CONFIG__USENET__SEGMENT_CACHE__ENABLED=false)
 if [[ $RCLONE_RC == true ]]; then
   ND_ENV+=(-e NZBDAV_CONFIG__RCLONE__RC_ENABLED=true
            -e "NZBDAV_CONFIG__RCLONE__HOST=http://$SERVER_IP:$P_RCLONE_RC"
-           -e NZBDAV_CONFIG__RCLONE__USER=rclone
+           -e "NZBDAV_CONFIG__RCLONE__USER=$RC_USER"
            -e "NZBDAV_CONFIG__RCLONE__PASS=$RC_PASS")
 fi
 run_ct infinidysk $P_INFINIDYSK "" -- \
@@ -1635,7 +1657,7 @@ else
 fi
 if [[ $RCLONE_RC == true ]] && ! docker inspect -f '{{index .Config.Labels "mediastack.hash"}}' infinidysk 2>/dev/null | grep -qv '<no value>'; then
   warn "RCLONE_RC=true: Bitte in InfiniDysk unter Settings → Rclone Server eintragen:"
-  warn "  Notifications an · Host http://$SERVER_IP:$P_RCLONE_RC · User rclone · Passwort: RC_PASS aus $SECRETS"
+  warn "  Notifications an · Host http://$SERVER_IP:$P_RCLONE_RC · User $RC_USER · Passwort: RC_PASS aus $SECRETS"
 fi
 code=$(curl -s -o /dev/null -w '%{http_code}' -u "$WEBDAV_USER:$WEBDAV_PASS" -X PROPFIND -H 'Depth: 1' "$DAV_URL" || true)
 [[ $code == 207 ]] || warn "WebDAV-Login liefert HTTP $code (erwartet 207) – Zugangsdaten prüfen. Werte in $SECRETS löschen und Script neu starten."
@@ -2081,14 +2103,25 @@ JF_TOKEN=$(jf_login) || JF_TOKEN=""
 JF_KEY=""
 if [[ -n $JF_TOKEN && $JF_TOKEN != null ]]; then
   existing=$(jfc GET /Library/VirtualFolders | jq -r '.[].Name')
+  # Emby aktiviert bei Anlage per API keine Anbieter -> ausdrücklich setzen
+  emby_type_options() {  # collectionType
+    [[ $MS_CT == emby ]] || { echo '[]'; return; }
+    jq -nc --arg t "$1" '
+      def to(ty; m; i): {Type:ty, MetadataFetchers:m, MetadataFetcherOrder:m, ImageFetchers:i, ImageFetcherOrder:i};
+      ["TheMovieDb","The Open Movie Database"] as $mm | ["TheMovieDb","FanArt"] as $im |
+      ["TheMovieDb","TheTVDB","The Open Movie Database"] as $mt | ["TheMovieDb","TheTVDB","FanArt"] as $it |
+      if $t == "movies" then [to("Movie"; $mm; $im), to("BoxSet"; ["TheMovieDb"]; $im)]
+      else [to("Series"; $mt; $it), to("Season"; ["TheMovieDb","TheTVDB"]; ["TheMovieDb","TheTVDB"]),
+            to("Episode"; ["TheMovieDb","TheTVDB"]; ["TheMovieDb","TheTVDB"])] end'
+  }
   add_lib() {  # name type path
     grep -qx "$1" <<<"$existing" && return 0
     jfc POST "/Library/VirtualFolders?name=$1&collectionType=$2&refreshLibrary=true" \
-      "$(jq -nc --arg p "$3" --arg l "$LANG_CODE" --arg c "$COUNTRY_CODE" '{LibraryOptions:{
+      "$(jq -nc --arg p "$3" --arg l "$LANG_CODE" --arg c "$COUNTRY_CODE" --argjson to "$(emby_type_options "$2")" '{LibraryOptions:({
           PathInfos:[{Path:$p}], PreferredMetadataLanguage:$l, MetadataCountryCode:$c,
           EnableTrickplayImageExtraction:false, ExtractTrickplayImagesDuringLibraryScan:false,
           EnableChapterImageExtraction:false, ExtractChapterImagesDuringLibraryScan:false,
-          EnableRealtimeMonitor:false }}')" >/dev/null && log "  Bibliothek $1 → $3"
+          EnableRealtimeMonitor:false } + (if ($to|length) > 0 then {TypeOptions:$to} else {} end))}')" >/dev/null && log "  Bibliothek $1 → $3"
   }
   add_lib Filme  movies  /data/media/movies
   add_lib Serien tvshows /data/media/tv
